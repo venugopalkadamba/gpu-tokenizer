@@ -1,0 +1,156 @@
+# ============================================
+# Python + C++ + CUDA .gitignore (Win + Linux)
+# ============================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+develop-eggs/
+.eggs/
+.installed.cfg
+pip-wheel-metadata/
+*.manifest
+*.spec
+MANIFEST
+.env
+.venv
+env/
+venv/
+ENV/
+.ipynb_checkpoints
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# --- Jupyter Notebooks ---
+*.ipynb_checkpoints
+.ipynb_checkpoints/
+
+# --- C/C++ Build Artifacts ---
+*.o
+*.obj
+*.lo
+*.la
+*.al
+*.libs
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.i
+*.ii
+*.s
+*.su
+*.idb
+*.pdb
+*.mod
+*.cmd
+*.a
+*.lib
+*.exp
+*.def
+*.cache
+*.dSYM/
+*.tlog
+
+# --- CUDA Artifacts ---
+*.ptx
+*.cubin
+*.fatbin
+*.gpu
+*.cuobjdump
+*.cudafe*
+*.nvlinkinfo
+*.nvvp
+*.nsight/
+*.nvprof
+*.device-link.o
+
+# --- Build Directories ---
+build/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+Makefile.in
+CMakeScripts/
+Testing/
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+*.cmake
+*.vcxproj*
+*.sln
+*.xcodeproj
+*.ninja
+.ninja_deps
+.ninja_log
+
+# --- OS Specific ---
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon
+.idea/
+
+# Linux
+*~
+.nfs*
+
+# --- IDEs / Editors ---
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.VC.opendb
+
+# VSCode
+.vscode/
+.history/
+
+# CLion / JetBrains
+.idea/
+cmake-build-debug/
+cmake-build-release/
+
+# --- Packaging ---
+*.tar
+*.tar.gz
+*.zip
+*.7z
+
+# --- Logs and dumps ---
+*.log
+*.err
+*.dump
+core
+
+# --- Custom project-specific ignores ---
+# Add your compiled kernel outputs or build dirs here:
+# e.g., /gpu_tokenizer/build/
