@@ -83,7 +83,6 @@ build/
 cmake-build*/
 CMakeFiles/
 CMakeCache.txt
-Makefile
 Makefile.in
 CMakeScripts/
 Testing/
@@ -97,6 +96,9 @@ compile_commands.json
 *.ninja
 .ninja_deps
 .ninja_log
+
+# --- External Libraries ---
+externals/
 
 # --- OS Specific ---
 # Windows
@@ -152,5 +154,5 @@ cmake-build-release/
 core
 
 # --- Custom project-specific ignores ---
-# Add your compiled kernel outputs or build dirs here:
-# e.g., /gpu_tokenizer/build/
+# Compiled CUDA executables (no extension)
+test_cuco
