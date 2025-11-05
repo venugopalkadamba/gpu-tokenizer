@@ -1,0 +1,28 @@
+# Makefile for BPE CPU version in C++
+
+# Compiler
+CXX = g++
+NVCC = nvcc
+
+# Flags
+CXXFLAGS = -O3 -std=c++11 -Wall
+NVCCFLAGS = -O3 -std=c++11 -arch=sm_61
+
+# Targets
+all: bpe_cpu
+
+# Compile CPU version with g++
+bpe_cpu: bpe_cpu.cu
+	$(CXX) $(CXXFLAGS) -o bpe_cpu bpe_cpu.cu
+
+# Compile with nvcc (for compatibility testing)
+bpe_cpu_nvcc: bpe_cpu.cu
+	$(NVCC) $(NVCCFLAGS) -o bpe_cpu_nvcc bpe_cpu.cu
+
+clean:
+	rm -f bpe_cpu bpe_cpu_nvcc
+
+run: bpe_cpu
+	./bpe_cpu
+
+.PHONY: all clean run

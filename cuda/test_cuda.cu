@@ -69,6 +69,36 @@ int main() {
 
     free(pair_counts);
 
+    printf("\n\nTest 3: Merge Pair\n");
+    printf("------------------\n");
+
+    int merge_input[] = {1, 2, 2, 3, 2, 3};
+    int merge_length = sizeof(merge_input) / sizeof(int);
+    int merge_output[6] = {0};
+
+    int merge_new_length = cuda_merge_pair(
+        merge_input,
+        merge_length,
+        2,
+        3,
+        99,
+        merge_output
+    );
+
+    printf("Input:  [");
+    for (int i = 0; i < merge_length; i++) {
+        printf("%d%s", merge_input[i], i < merge_length - 1 ? ", " : "");
+    }
+    printf("]\n");
+
+    printf("Output: [");
+    for (int i = 0; i < merge_new_length; i++) {
+        printf("%d%s", merge_output[i], i < merge_new_length - 1 ? ", " : "");
+    }
+    printf("]\n");
+
+    printf("New length: %d\n", merge_new_length);
+
     printf("\n=== Test Complete ===\n");
 
     return 0;

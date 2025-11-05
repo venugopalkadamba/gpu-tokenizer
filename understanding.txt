@@ -1,0 +1,15 @@
+bpe_cpu.py
+
+Complete Line Number Summary:
+
+    Step	    What Happens	            Key Lines	    Helper Functions
+0.  Entry	    User calls encode("Hello")	181-226	        -
+1.  Regex Split	Split text into chunks	    199, 204-205	re.finditer()
+2.  Byte Encode	Convert to bytes	        209-210	        38-55 (_bytes_to_unicode)
+3a. Initialize	Convert to characters	    139	            -
+3b. Get Pairs	Find adjacent pairs	        140	            104-118 (get_pairs)
+3c. Find Best	Find lowest rank pair	    150	            78 (merge_ranks dict)
+3d. Merge	    Merge all occurrences	    162-173	        -
+3e. Repeat	    Loop until done	            146, 170-173	-
+4.  Lookup ID	Get token ID from vocab	    219	            65 (loaded vocab)
+5.  Return	    Return list of IDs	        226	            -

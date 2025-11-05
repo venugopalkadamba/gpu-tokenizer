@@ -24,6 +24,15 @@ void cuda_count_pairs(
     int vocab_size
 );
 
+int cuda_merge_pair(
+    const int* h_tokens,
+    int length,
+    int pair_first,
+    int pair_second,
+    int merged_token,
+    int* h_out_tokens
+);
+
 /**
  * Test function - prints GPU info
  */

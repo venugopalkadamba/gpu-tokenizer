@@ -6,6 +6,9 @@ Works with real GPT-2 vocabulary for realistic benchmarking
 This is the BASELINE implementation that we'll optimize with GPU!
 """
 
+# ==============================================================================
+# IMPORTS
+# ==============================================================================
 import json
 import time
 import regex as re
@@ -15,6 +18,9 @@ from pathlib import Path
 import urllib.request
 
 
+# ==============================================================================
+# MAIN TOKENIZER CLASS
+# ==============================================================================
 class BPETokenizerCPU:
     """
     CPU-based BPE Tokenizer following GPT-2's approach
@@ -24,6 +30,10 @@ class BPETokenizerCPU:
     2. merges: List of merge rules (pair → merged token)
     3. encoder: The actual encoding logic
     """
+
+    # ==========================================================================
+    # SECTION 1: INITIALIZATION
+    # ==========================================================================
 
     def __init__(self, vocab_file: Optional[str] = None, merges_file: Optional[str] = None):
         """Initialize tokenizer with vocabulary and merge rules"""
@@ -54,6 +64,10 @@ class BPETokenizerCPU:
         cs = [chr(n) for n in cs]
         return dict(zip(bs, cs))
 
+    # ==========================================================================
+    # SECTION 2: LOADING VOCABULARY & MERGE RULES
+    # ==========================================================================
+
     def load_vocab(self, vocab_file: str, merges_file: str):
         """Load GPT-2 vocabulary and merge rules"""
         print(f"Loading vocabulary from {vocab_file}...")
@@ -62,7 +76,8 @@ class BPETokenizerCPU:
 
         print(f"Loading merges from {merges_file}...")
         with open(merges_file, 'r', encoding='utf-8') as f:
-            merges_data = f.read().split('\n')[1:-1]  # Skip header and empty last line
+            # Skip header line; keep every non-empty rule exactly as stored
+            merges_data = [line for line in f.read().splitlines()[1:] if line]
 
         self.merges = [tuple(merge.split()) for merge in merges_data]
 
@@ -73,6 +88,10 @@ class BPETokenizerCPU:
         self.merge_ranks = {pair: i for i, pair in enumerate(self.merges)}
 
         print(f"✓ Loaded {len(self.vocab)} tokens and {len(self.merges)} merge rules")
+
+    # ==========================================================================
+    # SECTION 3: DOWNLOADING GPT-2 FILES
+    # ==========================================================================
 
     @staticmethod
     def download_gpt2_files(output_dir: str = "data"):
@@ -97,12 +116,19 @@ class BPETokenizerCPU:
 
         return vocab_file, merges_file
 
+    # ==========================================================================
+    # SECTION 4: CORE BPE ALGORITHM *** THIS IS THE BOTTLENECK! ***
+    # ==========================================================================
+
     def get_pairs(self, word: Tuple[str, ...]) -> set:
         """
         Get all adjacent pairs in a word
 
         Example: ('l', 'o', 'w') → {('l', 'o'), ('o', 'w')}
         """
+        if len(word) < 2:
+            return set()
+
         pairs = set()
         prev_char = word[0]
         for char in word[1:]:
@@ -114,7 +140,7 @@ class BPETokenizerCPU:
         """
         Apply BPE merges to a token
 
-        This is THE CORE ALGORITHM that we'll parallelize on GPU!
+        *** THIS IS THE CORE ALGORITHM THAT WE'LL PARALLELIZE ON GPU! ***
 
         Steps:
         1. Start with character-level representation
@@ -123,20 +149,23 @@ class BPETokenizerCPU:
         4. Merge that pair
         5. Repeat until no more merges possible
         """
+        # ---- Quick check: token already in vocabulary? ----
         if token in self.vocab:
             return token
 
-        # Convert to tuple of characters
+        # ---- STEP 1: Convert to character-level tuple ----
+        # Example: "Hello" → ('H', 'e', 'l', 'l', 'o')
         word = tuple(token)
         pairs = self.get_pairs(word)
 
         if not pairs:
             return token
 
-        # Keep merging until no valid pairs remain
+        # ---- STEP 2: ITERATIVE MERGING LOOP (THE BOTTLENECK!) ----
         while True:
-            # Find the pair with highest priority (lowest rank = earliest in merge list)
-            # THIS IS THE BOTTLENECK: O(n) scan for each iteration
+            # --- BOTTLENECK #1: Find best pair to merge ---
+            # Scans ALL pairs to find which one has lowest rank (highest priority)
+            # 🎯 GPU OPPORTUNITY: Can parallelize this scan!
             bigram = min(pairs, key=lambda pair: self.merge_ranks.get(pair, float('inf')))
 
             if bigram not in self.merge_ranks:
@@ -146,8 +175,9 @@ class BPETokenizerCPU:
             new_word = []
             i = 0
 
-            # Merge all occurrences of the bigram
-            # THIS IS ANOTHER BOTTLENECK: O(n) scan
+            # --- BOTTLENECK #2: Merge all occurrences of the pair ---
+            # Scans entire word to find and merge the bigram
+            # 🎯 GPU OPPORTUNITY: Can parallelize this too!
             while i < len(word):
                 try:
                     j = word.index(first, i)
@@ -166,12 +196,17 @@ class BPETokenizerCPU:
 
             word = tuple(new_word)
 
+            # Check if done merging
             if len(word) == 1:
                 break
             else:
                 pairs = self.get_pairs(word)
 
         return ' '.join(word)
+
+    # ==========================================================================
+    # SECTION 5: ENCODING TEXT TO TOKEN IDs (THE MAIN ENTRY POINT!)
+    # ==========================================================================
 
     def encode(self, text: str, verbose: bool = False) -> List[int]:
         """
@@ -188,22 +223,29 @@ class BPETokenizerCPU:
             print(f"\nEncoding text: '{text[:100]}{'...' if len(text) > 100 else ''}'")
             start = time.time()
 
-        # GPT-2 pattern to split text into tokens before BPE
-        # This handles spaces, punctuation, etc.
+        # ---- STEP A: Split text into chunks using regex pattern ----
+        # Pattern splits on: contractions ('s, 't), letters, numbers, punctuation, spaces
+        # Example: "Hello, world!" → ["Hello", ",", " world", "!"]
         pat = re.compile(r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
 
         tokens = []
+
+        # ---- STEP B: Process each chunk ----
         for match in re.finditer(pat, text):
             token = match.group()
 
-            # Convert to bytes then to unicode chars
+            # --- STEP B1: Convert to byte representation ---
+            # Handles special characters safely using byte_encoder mapping
             token_bytes = token.encode('utf-8')
             token_unicode = ''.join(self.byte_encoder[b] for b in token_bytes)
 
-            # Apply BPE
+            # --- STEP B2: Apply BPE merging (THE SLOW PART!) ---
+            # This calls bpe() method which does iterative character merging
             bpe_tokens = self.bpe(token_unicode).split(' ')
 
-            # Convert to IDs
+            # --- STEP B3: Look up token IDs in vocabulary ---
+            # Convert token strings to their numeric IDs
+            # Example: "Hello" → 15496
             tokens.extend([self.vocab[bpe_token] for bpe_token in bpe_tokens])
 
         if verbose:
@@ -213,11 +255,19 @@ class BPETokenizerCPU:
 
         return tokens
 
+    # ==========================================================================
+    # SECTION 6: DECODING TOKEN IDs BACK TO TEXT
+    # ==========================================================================
+
     def decode(self, tokens: List[int]) -> str:
         """Decode token IDs back to text"""
         text = ''.join([self.inverse_vocab[token] for token in tokens])
         text_bytes = bytearray([self.byte_decoder[c] for c in text])
         return text_bytes.decode('utf-8', errors='replace')
+
+    # ==========================================================================
+    # SECTION 7: BENCHMARKING (Measure CPU Performance)
+    # ==========================================================================
 
     def benchmark(self, text: str, num_runs: int = 10):
         """Benchmark encoding performance"""
@@ -259,6 +309,10 @@ class BPETokenizerCPU:
         }
 
 
+# ==============================================================================
+# MAIN DEMO FUNCTION
+# ==============================================================================
+
 def main():
     """Demo the CPU tokenizer"""
     print("""
@@ -268,13 +322,19 @@ def main():
     ╚══════════════════════════════════════════════════════════════════╝
     """)
 
-    # Download GPT-2 files if needed
+    # --------------------------------------------------------------------------
+    # PART 1: Setup - Download GPT-2 vocabulary files
+    # --------------------------------------------------------------------------
     vocab_file, merges_file = BPETokenizerCPU.download_gpt2_files()
 
-    # Initialize tokenizer
+    # --------------------------------------------------------------------------
+    # PART 2: Initialize tokenizer with vocab
+    # --------------------------------------------------------------------------
     tokenizer = BPETokenizerCPU(vocab_file, merges_file)
 
-    # Test examples
+    # --------------------------------------------------------------------------
+    # PART 3: Test with example texts
+    # --------------------------------------------------------------------------
     test_texts = [
         "Hello, world!",
         "The quick brown fox jumps over the lazy dog.",
@@ -294,7 +354,9 @@ def main():
         assert text == decoded, "Decode mismatch!"
         print()
 
-    # Benchmark with longer text
+    # --------------------------------------------------------------------------
+    # PART 4: Benchmark with longer text
+    # --------------------------------------------------------------------------
     long_text = """
     Machine learning is a subset of artificial intelligence that focuses on the development
     of algorithms and statistical models that enable computer systems to improve their

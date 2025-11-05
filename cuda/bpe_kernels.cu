@@ -11,6 +11,9 @@
  */
 
 #include <cuda_runtime.h>
+#include <thrust/device_ptr.h>
+#include <thrust/scan.h>
+#include <thrust/reduce.h>
 #include <stdio.h>
 
 // ============================================================================
@@ -137,42 +140,42 @@ __global__ void find_max_pair_kernel(
  */
 __global__ void merge_pairs_kernel(
     const int* tokens_in,
-    int* tokens_out,
+    int* tokens_tmp,
     int* valid_mask,
+    int* claimed_flags,
     int length,
     int pair_first,
     int pair_second,
     int merged_token
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= length) {
+        return;
+    }
 
-    if (idx < length) {
-        // Check if current position starts a pair to merge
-        if (idx < length - 1 &&
-            tokens_in[idx] == pair_first &&
-            tokens_in[idx + 1] == pair_second) {
+    bool merged_here = false;
+    if (idx < length - 1 &&
+        tokens_in[idx] == pair_first &&
+        tokens_in[idx + 1] == pair_second) {
 
-            // This position merges with next
-            tokens_out[idx] = merged_token;
-            valid_mask[idx] = 1;
-
-            // Next position is consumed (unless it also starts a pair)
-            // This check prevents conflicts
-            if (idx + 1 < length - 1 &&
-                tokens_in[idx + 1] == pair_first &&
-                tokens_in[idx + 2] == pair_second) {
-                // Next position also starts a pair - let it merge
-                valid_mask[idx + 1] = 1;
+        if (atomicCAS(&claimed_flags[idx], 0, 1) == 0) {
+            if (atomicCAS(&claimed_flags[idx + 1], 0, 1) == 0) {
+                merged_here = true;
             } else {
-                valid_mask[idx + 1] = 0;  // Consumed
+                atomicExch(&claimed_flags[idx], 0);
             }
-        } else if (idx > 0 && valid_mask[idx] == 0) {
-            // Already marked as consumed by previous thread
-            // Do nothing
-        } else {
-            // No merge at this position
-            tokens_out[idx] = tokens_in[idx];
+        }
+    }
+
+    if (merged_here) {
+        tokens_tmp[idx] = merged_token;
+        valid_mask[idx] = 1;
+    } else {
+        if (claimed_flags[idx] == 0) {
+            tokens_tmp[idx] = tokens_in[idx];
             valid_mask[idx] = 1;
+        } else {
+            valid_mask[idx] = 0;
         }
     }
 }
@@ -294,6 +297,85 @@ void cuda_count_pairs(
     // Cleanup
     cudaFree(d_tokens);
     cudaFree(d_pair_counts);
+}
+
+int cuda_merge_pair(
+    const int* h_tokens,
+    int length,
+    int pair_first,
+    int pair_second,
+    int merged_token,
+    int* h_out_tokens
+) {
+    if (length <= 0) {
+        return 0;
+    }
+
+    const int threads = 256;
+    const int blocks = (length + threads - 1) / threads;
+
+    size_t bytes = sizeof(int) * length;
+
+    int* d_tokens_in = nullptr;
+    int* d_tokens_tmp = nullptr;
+    int* d_tokens_out = nullptr;
+    int* d_valid_mask = nullptr;
+    int* d_prefix = nullptr;
+    int* d_claimed = nullptr;
+
+    cudaMalloc(&d_tokens_in, bytes);
+    cudaMalloc(&d_tokens_tmp, bytes);
+    cudaMalloc(&d_tokens_out, bytes);
+    cudaMalloc(&d_valid_mask, bytes);
+    cudaMalloc(&d_prefix, bytes);
+    cudaMalloc(&d_claimed, bytes);
+
+    cudaMemcpy(d_tokens_in, h_tokens, bytes, cudaMemcpyHostToDevice);
+    cudaMemset(d_tokens_tmp, 0, bytes);
+    cudaMemset(d_valid_mask, 0, bytes);
+    cudaMemset(d_prefix, 0, bytes);
+    cudaMemset(d_claimed, 0, bytes);
+
+    merge_pairs_kernel<<<blocks, threads>>>(
+        d_tokens_in,
+        d_tokens_tmp,
+        d_valid_mask,
+        d_claimed,
+        length,
+        pair_first,
+        pair_second,
+        merged_token
+    );
+
+    // Build exclusive offsets for compaction.
+    thrust::device_ptr<int> valid_ptr(d_valid_mask);
+    thrust::device_ptr<int> prefix_ptr(d_prefix);
+    thrust::exclusive_scan(valid_ptr, valid_ptr + length, prefix_ptr);
+
+    int new_length = thrust::reduce(valid_ptr, valid_ptr + length);
+
+    compact_tokens_kernel<<<blocks, threads>>>(
+        d_tokens_tmp,
+        d_tokens_out,
+        d_valid_mask,
+        d_prefix,
+        length
+    );
+
+    cudaDeviceSynchronize();
+
+    if (new_length > 0) {
+        cudaMemcpy(h_out_tokens, d_tokens_out, sizeof(int) * new_length, cudaMemcpyDeviceToHost);
+    }
+
+    cudaFree(d_tokens_in);
+    cudaFree(d_tokens_tmp);
+    cudaFree(d_tokens_out);
+    cudaFree(d_valid_mask);
+    cudaFree(d_prefix);
+    cudaFree(d_claimed);
+
+    return new_length;
 }
 
 /**
