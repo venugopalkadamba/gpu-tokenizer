@@ -156,3 +156,10 @@ core
 # --- Custom project-specific ignores ---
 # Compiled CUDA executables (no extension)
 test_cuco
+gpu_tokenizer
+gpu_tokenizer_optimized
+
+# NVIDIA Nsight Systems profiling outputs
+*.nsys-rep
+*.qdstrm
+report*.sqlite

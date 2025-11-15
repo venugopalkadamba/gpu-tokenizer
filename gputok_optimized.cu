@@ -1,6 +1,11 @@
 // GPU Byte-level BPE Tokenizer (Block-style) using cuCollections
 //
-// High-level design:
+// Optimized variant:
+// - Same overall algorithm as main.cu, but reduces redundant cuco::static_map
+//   lookups in the GPU kernel by caching both rank and new_token for each pair
+//   in shared memory. This removes one hash-table lookup per merged pair.
+//
+// High-level design (same as original):
 // - Implements a byte-level BPE tokenizer similar in spirit to BlockBPE:
 //   * No regex pre-tokenization, we operate directly on bytes.
 //   * Uses GPT-2 style byte encoder to map bytes -> initial symbol alphabet.
@@ -16,12 +21,6 @@
 //   * Encodes them to initial tokens with GPT-2 byte encoder
 //   * Runs CPU and GPU BPE, checks for equality, and times both.
 //
-// NOTE:
-// - We intentionally do NOT rely on vocab.json contents to keep parsing simple.
-//   Instead, we reconstruct the GPT-2 style byte encoder algorithmically and
-//   derive a token ID space purely from the base alphabet + merges list.
-// - This is sufficient to reproduce the BlockBPE-style GPU algorithm and
-//   compare CPU vs GPU behavior and throughput.
 
 #include <cuco/static_map.cuh>
 
@@ -56,18 +55,6 @@ inline void check_cuda(cudaError_t err, const char* msg)
 // from bytes 0..255 to a "safe" set of unicode chars (to make BPE operate at
 // the byte level while staying Unicode-friendly).
 //
-// Python reference:
-//   bs = list(range(ord("!"), ord("~")+1)) + \
-//        list(range(ord("¡"), ord("¬")+1)) + \
-//        list(range(ord("®"), ord("ÿ")+1))
-//   cs = bs[:]
-//   n = 0
-//   for b in range(256):
-//       if b not in bs:
-//           bs.append(b)
-//           cs.append(256+n)
-//           n += 1
-//   byte_encoder = dict(zip(bs, [chr(c) for c in cs]))
 
 std::string codepoint_to_utf8(int codepoint)
 {
@@ -140,8 +127,8 @@ struct PairInfo {
   std::int32_t new_token;
 };
 
-using PairKey  = std::uint64_t;  // pack (token_a, token_b)
-using PairVal  = std::uint64_t;  // pack (rank, new_token)
+using PairKey    = std::uint64_t;  // pack (token_a, token_b)
+using PairVal    = std::uint64_t;  // pack (rank, new_token)
 using CpuPairMap = std::unordered_map<PairKey, PairInfo>;
 
 __host__ __device__ inline PairKey pack_pair(std::int32_t a, std::int32_t b)
@@ -254,7 +241,7 @@ void bpe_merge_cpu(std::vector<std::int32_t>& tokens,
   constexpr std::uint32_t INF_RANK = std::numeric_limits<std::uint32_t>::max();
 
   bool changed = true;
-  int iter     = 0;
+  int  iter    = 0;
   while (changed && iter < max_iters) {
     int n = static_cast<int>(tokens.size());
     if (n < 2) break;
@@ -319,18 +306,23 @@ void bpe_merge_cpu(std::vector<std::int32_t>& tokens,
 
 // -------------------------- GPU BPE with cuCollections ---------------------
 
-using PairProbing   = cuco::linear_probing<1, cuco::default_hash_function<PairKey>>;
-using DevicePairMap = cuco::static_map<PairKey, PairVal, cuco::extent<std::size_t>, cuda::thread_scope_device, cuda::std::equal_to<PairKey>, PairProbing>;
-using DevicePairMapRef = decltype(std::declval<DevicePairMap>().ref(cuco::find));
+using PairProbing       = cuco::linear_probing<1, cuco::default_hash_function<PairKey>>;
+using DevicePairMap     = cuco::static_map<PairKey,
+                                       PairVal,
+                                       cuco::extent<std::size_t>,
+                                       cuda::thread_scope_device,
+                                       cuda::std::equal_to<PairKey>,
+                                       PairProbing>;
+using DevicePairMapRef  = decltype(std::declval<DevicePairMap>().ref(cuco::find));
 
-__global__ void bpe_merge_kernel(DevicePairMapRef map_ref,
-                                 const std::int32_t* __restrict__ d_tokens_in,
-                                 const int* __restrict__ d_offsets,
-                                 const int* __restrict__ d_lengths,
-                                 std::int32_t* __restrict__ d_tokens_out,
-                                 int* __restrict__ d_out_lengths,
-                                 int max_seq_len,
-                                 int max_iters)
+__global__ void bpe_merge_kernel_optimized(DevicePairMapRef map_ref,
+                                           const std::int32_t* __restrict__ d_tokens_in,
+                                           const int* __restrict__ d_offsets,
+                                           const int* __restrict__ d_lengths,
+                                           std::int32_t* __restrict__ d_tokens_out,
+                                           int* __restrict__ d_out_lengths,
+                                           int max_seq_len,
+                                           int max_iters)
 {
   int seq_id = blockIdx.x;
   int tid    = threadIdx.x;
@@ -340,9 +332,10 @@ __global__ void bpe_merge_kernel(DevicePairMapRef map_ref,
   if (len <= 0 || len > max_seq_len) return;
 
   extern __shared__ unsigned char smem[];
-  std::int32_t* sh_tokens     = reinterpret_cast<std::int32_t*>(smem);
-  std::uint32_t* sh_ranks     = reinterpret_cast<std::uint32_t*>(sh_tokens + max_seq_len);
-  unsigned char* sh_mergehere = reinterpret_cast<unsigned char*>(sh_ranks + max_seq_len);
+  std::int32_t*  sh_tokens     = reinterpret_cast<std::int32_t*>(smem);
+  std::uint32_t* sh_ranks      = reinterpret_cast<std::uint32_t*>(sh_tokens + max_seq_len);
+  std::int32_t*  sh_new_token  = reinterpret_cast<std::int32_t*>(sh_ranks + max_seq_len);
+  unsigned char* sh_mergehere  = reinterpret_cast<unsigned char*>(sh_new_token + max_seq_len);
 
   __shared__ int sh_len;
   __shared__ int sh_changed;
@@ -370,22 +363,25 @@ __global__ void bpe_merge_kernel(DevicePairMapRef map_ref,
 
     int cur_len = sh_len;
 
-    // 1. Compute ranks for each adjacent pair
+    // 1. Compute ranks and new_token for each adjacent pair
     for (int i = tid; i < cur_len - 1; i += blockDim.x) {
       PairKey key = pack_pair(sh_tokens[i], sh_tokens[i + 1]);
-      auto it     = map_ref.find(key);
+      auto    it  = map_ref.find(key);
       if (it != map_ref.end()) {
-        PairVal v      = (*it).second;
-        PairInfo info  = unpack_val(v);
-        sh_ranks[i]    = info.rank;
+        PairVal v     = (*it).second;
+        PairInfo info = unpack_val(v);
+        sh_ranks[i]   = info.rank;
+        sh_new_token[i] = info.new_token;
       } else {
-        sh_ranks[i] = INF_RANK;
+        sh_ranks[i]    = INF_RANK;
+        sh_new_token[i] = -1;
       }
     }
 
     // For convenience, set last rank to INF (no pair)
     if (tid == 0 && cur_len - 1 >= 0) {
-      sh_ranks[cur_len - 1] = INF_RANK;
+      sh_ranks[cur_len - 1]   = INF_RANK;
+      sh_new_token[cur_len - 1] = -1;
     }
     __syncthreads();
 
@@ -419,18 +415,9 @@ __global__ void bpe_merge_kernel(DevicePairMapRef map_ref,
       int i         = 0;
       while (i < cur_len) {
         if (i < cur_len - 1 && sh_mergehere[i]) {
-          PairKey key = pack_pair(sh_tokens[i], sh_tokens[i + 1]);
-          auto it     = map_ref.find(key);
-          if (it != map_ref.end()) {
-            PairVal v     = (*it).second;
-            PairInfo info = unpack_val(v);
-            sh_tokens[write_idx++] = info.new_token;
-            i += 2;
-          } else {
-            // Fallback: no merge
-            sh_tokens[write_idx++] = sh_tokens[i];
-            ++i;
-          }
+          // Use cached new_token instead of looking into the map again
+          sh_tokens[write_idx++] = sh_new_token[i];
+          i += 2;
         } else if (i > 0 && sh_mergehere[i - 1]) {
           // This position was merged with previous, skip
           ++i;
@@ -465,7 +452,7 @@ std::vector<std::string> read_lines(const std::string& path, int max_lines = 100
     throw std::runtime_error("Failed to open input file: " + path);
   }
   std::vector<std::string> lines;
-  std::string line;
+  std::string              line;
   while (std::getline(in, line)) {
     lines.push_back(line);
     if (max_lines > 0 && static_cast<int>(lines.size()) >= max_lines) break;
@@ -482,7 +469,7 @@ std::vector<std::int32_t> encode_text_to_tokens(const std::string& text,
 
   for (unsigned char c : text) {
     const std::string& sym = enc.byte_to_symbol[static_cast<int>(c)];
-    auto it               = vocab.token_to_id.find(sym);
+    auto               it  = vocab.token_to_id.find(sym);
     if (it == vocab.token_to_id.end()) {
       throw std::runtime_error("Byte encoder symbol not found in vocab");
     }
@@ -500,7 +487,7 @@ int main(int argc, char** argv)
     const std::string input_path  = "data/input/pride_and_prejudice.txt";
 
     ByteEncoder encoder;
-    BPEVocab vocab;
+    BPEVocab   vocab;
     build_vocab_and_merges(merges_path, vocab, encoder);
 
     // Optional command-line arg: chunk size in tokens (default 2048)
@@ -548,10 +535,10 @@ int main(int argc, char** argv)
               << " chunk(s), max tokens per chunk: " << max_seq_len << std::endl;
 
     // Flatten sequences for GPU
-    int num_seqs = static_cast<int>(cpu_seqs.size());
-    std::vector<int> h_offsets(num_seqs);
-    std::vector<int> h_lengths(num_seqs);
-    std::vector<std::int32_t> h_tokens_flat;
+    int                             num_seqs = static_cast<int>(cpu_seqs.size());
+    std::vector<int>                h_offsets(num_seqs);
+    std::vector<int>                h_lengths(num_seqs);
+    std::vector<std::int32_t>       h_tokens_flat;
 
     int offset = 0;
     for (int i = 0; i < num_seqs; ++i) {
@@ -567,7 +554,7 @@ int main(int argc, char** argv)
 
     // Build CPU pair map already inside vocab.cpu_pairs
     // Prepare GPU static_map for pair->(rank,new_token)
-    std::size_t num_pairs = vocab.cpu_pairs.size();
+    std::size_t num_pairs  = vocab.cpu_pairs.size();
     double      load_factor = 0.5;
     std::size_t capacity    = static_cast<std::size_t>(std::ceil(num_pairs / load_factor));
     PairKey     empty_key   = std::numeric_limits<PairKey>::max();
@@ -606,9 +593,9 @@ int main(int argc, char** argv)
     // Allocate device buffers for tokens/offsets/lengths
     std::int32_t* d_tokens_in  = nullptr;
     std::int32_t* d_tokens_out = nullptr;
-    int* d_offsets             = nullptr;
-    int* d_lengths             = nullptr;
-    int* d_out_lengths         = nullptr;
+    int*          d_offsets    = nullptr;
+    int*          d_lengths    = nullptr;
+    int*          d_out_lengths = nullptr;
 
     check_cuda(cudaMalloc(&d_tokens_in, total_tokens * sizeof(std::int32_t)), "cudaMalloc tokens_in");
     check_cuda(cudaMalloc(&d_tokens_out, total_tokens * sizeof(std::int32_t)), "cudaMalloc tokens_out");
@@ -638,39 +625,39 @@ int main(int argc, char** argv)
     for (int i = 0; i < num_seqs; ++i) {
       bpe_merge_cpu(cpu_tokens_merged[i], vocab.cpu_pairs);
     }
-    auto cpu_end = std::chrono::high_resolution_clock::now();
+    auto  cpu_end = std::chrono::high_resolution_clock::now();
     double cpu_ms =
       std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count() / 1000.0;
 
-    // GPU BPE timing
+    // GPU BPE timing (optimized kernel)
     int block_size = 128;
     int grid_size  = num_seqs;
     int max_iters  = 50;
 
     std::size_t shared_bytes =
       static_cast<std::size_t>(max_seq_len) *
-      (sizeof(std::int32_t) + sizeof(std::uint32_t) + sizeof(unsigned char));
+      (sizeof(std::int32_t) + sizeof(std::uint32_t) + sizeof(std::int32_t) + sizeof(unsigned char));
 
     cudaEvent_t ev_start, ev_end;
     cudaEventCreate(&ev_start);
     cudaEventCreate(&ev_end);
 
     cudaEventRecord(ev_start);
-    bpe_merge_kernel<<<grid_size, block_size, shared_bytes>>>(
+    bpe_merge_kernel_optimized<<<grid_size, block_size, shared_bytes>>>(
       d_map_ref, d_tokens_in, d_offsets, d_lengths, d_tokens_out, d_out_lengths, max_seq_len, max_iters);
     cudaEventRecord(ev_end);
     cudaEventSynchronize(ev_end);
     float gpu_ms = 0.0f;
     cudaEventElapsedTime(&gpu_ms, ev_start, ev_end);
 
-    check_cuda(cudaGetLastError(), "bpe_merge_kernel");
+    check_cuda(cudaGetLastError(), "bpe_merge_kernel_optimized");
 
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_end);
 
     // Copy GPU outputs back
     std::vector<std::int32_t> h_tokens_out(total_tokens);
-    std::vector<int> h_out_lengths(num_seqs);
+    std::vector<int>          h_out_lengths(num_seqs);
     check_cuda(cudaMemcpy(h_tokens_out.data(),
                           d_tokens_out,
                           total_tokens * sizeof(std::int32_t),
@@ -713,23 +700,21 @@ int main(int argc, char** argv)
     }
 
     std::cout << "CPU BPE time: " << cpu_ms << " ms" << std::endl;
-    std::cout << "GPU BPE kernel time (excl. H2D/D2H): " << gpu_ms << " ms" << std::endl;
+    std::cout << "GPU BPE kernel time (optimized, excl. H2D/D2H): " << gpu_ms << " ms" << std::endl;
     if (gpu_ms > 0.0f) {
-      double speedup      = cpu_ms / gpu_ms;
+      double speedup       = cpu_ms / gpu_ms;
       double gpu_tok_per_s = (static_cast<double>(total_tokens) / (gpu_ms / 1000.0));
       double cpu_tok_per_s = (static_cast<double>(total_tokens) / (cpu_ms / 1000.0));
-      std::cout << "Approximate speedup (CPU / GPU kernel): " << speedup << "x" << std::endl;
+      std::cout << "Approximate speedup (CPU / GPU optimized kernel): " << speedup << "x" << std::endl;
       std::cout << "CPU throughput: " << cpu_tok_per_s << " tokens/s" << std::endl;
-      std::cout << "GPU kernel throughput: " << gpu_tok_per_s << " tokens/s" << std::endl;
+      std::cout << "GPU optimized kernel throughput: " << gpu_tok_per_s << " tokens/s" << std::endl;
     }
-    std::cout << "CPU vs GPU token match: " << (all_ok ? "OK" : "MISMATCH") << std::endl;
+    std::cout << "CPU vs GPU token match (optimized): " << (all_ok ? "OK" : "MISMATCH") << std::endl;
 
     // Write final tokenized output (GPU result) to file in data/output.
-    // Each line corresponds to one input line; tokens are written as their
-    // textual BPE pieces (e.g., \"ĠThe\"), space-separated.
     {
-      const std::string out_path = "data/output/gpu_tokens.txt";
-      std::ofstream out(out_path);
+      const std::string out_path = "data/output/gpu_tokens_optimized.txt";
+      std::ofstream     out(out_path);
       if (!out) {
         std::cerr << "Failed to open output file for writing: " << out_path << std::endl;
       } else {
@@ -748,7 +733,7 @@ int main(int argc, char** argv)
           }
           out << '\n';
         }
-        std::cerr << "Wrote GPU tokens to " << out_path << std::endl;
+        std::cerr << "Wrote GPU optimized tokens to " << out_path << std::endl;
       }
     }
 
