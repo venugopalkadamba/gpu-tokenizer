@@ -497,7 +497,8 @@ int main(int argc, char** argv)
 {
   try {
     const std::string merges_path = "data/gpt2_tokenizer/merges.txt";
-    const std::string input_path  = "data/input/pride_and_prejudice.txt";
+    // Default input path; can be overridden via argv[2]
+    std::string input_path  = "data/input/pride_and_prejudice.txt";
 
     ByteEncoder encoder;
     BPEVocab vocab;
@@ -512,6 +513,11 @@ int main(int argc, char** argv)
         std::cerr << "Warning: failed to parse chunk size from argv[1]; using default "
                   << chunk_tokens << std::endl;
       }
+    }
+
+    // Optional command-line arg: input text file path (default as above)
+    if (argc > 2) {
+      input_path = argv[2];
     }
 
     // Read entire file as a single text sequence
@@ -643,7 +649,10 @@ int main(int argc, char** argv)
       std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count() / 1000.0;
 
     // GPU BPE timing
-    int block_size = 128;
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 256
+#endif
+    int block_size = BLOCK_SIZE;
     int grid_size  = num_seqs;
     int max_iters  = 50;
 

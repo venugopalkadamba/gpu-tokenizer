@@ -158,8 +158,10 @@ core
 test_cuco
 gpu_tokenizer
 gpu_tokenizer_optimized
+gpu_tokenizer_bs*
+gpu_tokenizer_optimized_bs*
 
 # NVIDIA Nsight Systems profiling outputs
 *.nsys-rep
 *.qdstrm
-report*.sqlite
+*.sqlite
