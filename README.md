@@ -2,252 +2,233 @@
 
 ### What the files do
 
-- **`gputok.cu`**: Baseline CUDA implementation of a byte-level BPE tokenizer using cuCollections `static_map`. It:
-  - Reconstructs the GPT-2 byte encoder.
-  - Builds a BPE vocabulary and merge table from `data/gpt2_tokenizer/merges.txt`.
-  - Tokenizes a large text (default: `data/input/pride_and_prejudice.txt`) into token chunks on CPU.
-  - Runs the BPE merge algorithm on CPU and GPU, compares outputs, and reports timing/throughput.
-- **`gputok_optimized.cu`**: Optimized CUDA version of the same tokenizer. The algorithm is identical, but the GPU kernel:
-  - Caches both the merge **rank** and **new token id** for each adjacent pair in shared memory.
-  - Avoids a second `static_map` lookup when actually merging pairs.
-  - This reduces global memory traffic and hash lookups, improving GPU kernel throughput.
-- **`gputok_binding.cu`**: Pybind11-based CUDA extension used by the Python benchmarks to expose a `GpuTokenizer` class to Python.
-- **`benchmark_tokenizer_scaling.py`**: Benchmarks how tokenizer speed scales with input length on WikiText‑103 for:
-  - GPU BlockBPE (via `gputok_binding.cu`, if the extension can be built),
-  - `tiktoken` GPT‑2 tokenizer,
-  - HuggingFace GPT‑2 tokenizer.
-- **`compare_generation_quality.py`**: Compares generation quality on WikiText‑103:
-  - For each sampled prompt, tokenizes with GPU BlockBPE, `tiktoken`, and HuggingFace GPT‑2,
-  - Generates continuations with GPT‑2,
-  - Compares each continuation against the ground-truth continuation with simple similarity metrics.
+- **`gputok_blockbpe.cu`**: Baseline CUDA implementation of a byte-level BPE tokenizer that follows BlockBPE’s greedy Algorithm 1 on GPU: we reconstruct the GPT‑2 byte encoder, build a BPE vocabulary and merge table from `data/gpt2_tokenizer/merges.txt`, chunk a long text on CPU, and run a BlockBPE-style kernel that finds the globally best merge pair per pass and merges the left-most occurrence.
+- **`gputok_blockbpe_optimized.cu`**: Optimized CUDA variant of the same semantics. We keep one block per chunk and the same global-argmin merge rule, but simplify compaction to a fully double-buffered, thread-coarsened scheme for all sequence lengths, reducing shared-memory usage and synchronization while preserving exact CPU–GPU token equality.
+- **`gputok_binding.cu`**: Pybind11-based CUDA extension that exposes a `GpuTokenizer` class to Python. It reconstructs the GPT‑2 byte encoder and BPE merges once, builds a device `static_map`, and provides (1) a CPU reference tokenizer, (2) an optimized BlockBPE kernel, and (3) a baseline BlockBPE kernel for use in the Python benchmarks.
+- **`benchmark_tokenizer_scaling.py`**: Benchmarks tokenizer speed on WikiText‑103 for GPU BlockBPE (via `gputok_binding.cu`), CPU BlockBPE, `tiktoken`, and HuggingFace GPT‑2 in both batch and latency modes.
+- **`compare_generation_quality.py`**: Compares generation quality on WikiText‑103 by tokenizing prompts with GPU BlockBPE (optimized and baseline), `tiktoken`, and HuggingFace GPT‑2, then generating continuations with GPT‑2 and evaluating simple overlap-based similarity metrics against the ground-truth continuation.
 
-### BPE algorithm (simple explanation, optimized CUDA version)
+### BPE algorithm and BlockBPE-style GPU implementation
 
-1. **Byte encoding**: Each input byte (0–255) is mapped to a “safe” Unicode symbol (GPT‑2 byte encoder), giving an initial sequence of token ids (one per byte).
-2. **Merge table**: From `merges.txt`, we build a table of adjacent token pairs → (rank, new_token_id). Lower rank = higher priority merge.
-3. **Iterative merge passes** (per chunk / per CUDA block):
-   - For each position `i`, look up the pair `(token[i], token[i+1])` in a GPU `static_map`.
-   - If the pair exists, cache its `rank` and `new_token_id` in shared memory.
-   - Decide which positions to merge using a local rule:
-     - A pair can merge only if its rank is better than its left neighbor and **not worse** than its right neighbor, ensuring non‑overlapping merges.
-   - Sequentially compact the sequence:
-     - If `merge_here[i]` is set, write `new_token_id` and skip `i+1`.
-     - Otherwise, copy the original token.
-   - Repeat until no more merges fire or `max_iters` is reached.
-4. **Optimized kernel change**: Compared to `gputok.cu`, the optimized kernel stores both rank and new token id in shared memory per pair, so the actual merge step does **not** re-query the hash map. This yields higher GPU throughput with identical outputs.
+- **Byte-level pre-tokenization (replacing Regex)**  
+  We follow BlockBPE’s decision to remove Regex pre-tokenization and operate directly at the byte level with a GPT‑2 style byte encoder [BlockBPE paper](https://arxiv.org/pdf/2507.11941). Each input byte \(0\ldots255\) is mapped to a “safe” Unicode symbol, and we look up the corresponding vocabulary id, producing an initial token sequence that matches GPT‑2’s byte-level behavior without any Regex splitting.
 
-### How to build and run the CUDA tokenizers
+- **Greedy BPE merges (Algorithm 1 semantics)**  
+  On CPU, we implement the exact greedy algorithm described in BlockBPE §3 / Algorithm 1 [BlockBPE paper](https://arxiv.org/pdf/2507.11941): while there exists a mergeable adjacent pair in the sequence, we (1) scan all pairs, (2) find the pair with the globally lowest rank in the merge table (ties broken by left-most position), (3) merge only the left-most occurrence of that pair into a new token, and (4) rebuild the sequence. We repeat until no pair from the merge table appears.
 
-#### Prerequisites
+- **Parallel merge passes on GPU (one block per chunk)**  
+  On GPU, we adapt BlockBPE’s thread-level view of a merge pass:
+  - For a sequence of length \(n\), we conceptually launch a block of up to \(n\) threads that operate on adjacent pairs \((i, i+1)\). Thread \(i\):
+    1. Reads tokens \(i\) and \(i+1\) from shared memory.
+    2. Performs a `static_map` lookup in the GPU-resident merge table \(M\) to obtain the pair’s rank.
+    3. Tracks its local best (rank, position).
+  - We perform a block-wide argmin reduction over all local candidates to get the globally best (rank, position) pair, matching Algorithm 1’s global choice.
+  - Once the best pair is known, threads mark where the merge should happen and cooperatively compact the sequence:
+    - Indices before the best position are copied unchanged.
+    - At the best position we write the merged token id.
+    - The token at best position+1 is removed.
+    - All tokens to the right shift left by one index.
+  - When the sequence length \(n\) exceeds the block size, each thread strides over the sequence \(d = \lceil n / \text{block size} \rceil\) times, yielding overall \(O(nd)\) complexity as in BlockBPE §4.2, with the ideal case \(d=1\) when the block spans the full sequence.
 
-- CUDA toolkit with `nvcc` available.
-- A GPU with sufficient memory.
-- cuCollections and CCCL are vendored under `externals/` in this repo.
+- **Use of cuCollections and CCCL/CUB**  
+  We use cuCollections `static_map` for highly optimized hash lookups of merge pairs on GPU, and CCCL/CUB primitives for block-wide prefix scans and reductions:
+  - In the baseline kernel, for shorter sequences we use a per-block prefix scan over a 0/1 “remove” mask to compute compacted write indices.
+  - In the optimized variant, we rely on a simplified double-buffered compaction scheme and keep the same block-wide argmin, reducing synchronization overhead while maintaining the same greedy merge semantics.
 
-#### Build
+### How we derived and optimized our BlockBPE kernels
 
-From the project root (`gpu-tokenizer`):
+- **Baseline BlockBPE kernel (`gputok_blockbpe.cu`)**  
+  We start from the BlockBPE paper’s Algorithm 1 [BlockBPE paper](https://arxiv.org/pdf/2507.11941) and implement a one-block-per-sequence kernel that:
+  - Stores tokens in shared memory, flattens the merge table into a device `static_map`, and in each iteration:
+    - Computes per-thread local minima over ranks.
+    - Reduces to a global best (rank, position) inside the block.
+    - Performs a block-wide compaction using either a CUB `BlockScan` (for shorter sequences) or a strided double-buffered shift (for longer sequences).
+  - Matches the CPU greedy implementation exactly, and we verify CPU vs GPU token-by-token equality for every chunk.
+
+- **Optimized BlockBPE kernel (`gputok_blockbpe_optimized.cu`)**  
+  We then simplify and optimize the compaction step:
+  - We retain the same one-block-per-string design and the same global argmin over pair ranks.
+  - We remove the split “short vs long sequence” paths and instead always use a thread-coarsened, double-buffered compaction: each thread strides over indices, writes the merged token at the best position, skips the token at best position+1, and shifts all later tokens left by one.
+  - This reduces shared-memory footprint and synchronization, while profiling shows that we preserve Algorithm 1 semantics and maintain exact CPU–GPU equality.
+
+### Installation, build, and run
+
+- **Prerequisites**
+  - A CUDA-capable GPU.
+  - CUDA 13.0 module available as `cuda-13.0`.
+  - Git, Python 3, and a C++17-capable `nvcc`.
+
+- **Clone dependencies**
+  From the project root (`gpu-tokenizer`):
+
+```bash
+mkdir -p externals
+cd externals
+git clone https://github.com/NVIDIA/cccl.git
+git clone https://github.com/NVIDIA/cuCollections.git
+cd ..
+```
+
+- **Load CUDA module**
+
+```bash
+module load cuda-13.0
+```
+
+- **Build BlockBPE binaries**
 
 ```bash
 nvcc -O3 -std=c++17 --expt-extended-lambda \
-  gputok.cu -o gpu_tokenizer \
+  gputok_blockbpe.cu -o gpu_tokenizer_blockbpe \
   -Iexternals/cuCollections/include -Iexternals/cccl/include
 
 nvcc -O3 -std=c++17 --expt-extended-lambda \
-  gputok_optimized.cu -o gpu_tokenizer_optimized \
+  gputok_blockbpe_optimized.cu -o gpu_tokenizer_blockbpe_optimized \
   -Iexternals/cuCollections/include -Iexternals/cccl/include
 ```
 
-#### Run on `Pride and Prejudice`
+- **Run on `Pride and Prejudice`**
 
-Input text is expected at `data/input/pride_and_prejudice.txt`, and GPT‑2 merges at `data/gpt2_tokenizer/merges.txt`.
+Input text is expected at `data/input/pride_and_prejudice.txt`, and GPT‑2 merges at `data/gpt2_tokenizer/merges.txt`:
 
 ```bash
-./gpu_tokenizer 2048 data/input/pride_and_prejudice.txt
-./gpu_tokenizer_optimized 2048 data/input/pride_and_prejudice.txt
+./gpu_tokenizer_blockbpe 2048 data/input/pride_and_prejudice.txt
+./gpu_tokenizer_blockbpe_optimized 2048 data/input/pride_and_prejudice.txt
 ```
 
-Each binary prints CPU vs GPU timing, throughput, and writes GPU tokens to:
+Each binary prints CPU vs GPU timing, approximate throughput, and writes GPU tokens to `data/output/gpu_tokens_blockbpe.txt`.
 
-- Baseline: `data/output/gpu_tokens.txt`
-- Optimized: `data/output/gpu_tokens_optimized.txt`
+- **Python environment and benchmarks**
 
-### How to run the Python benchmarks
-
-#### 1. Python environment and dependencies
-
-Create virtual environment
+We typically use a dedicated virtual environment:
 
 ```bash
-python3 -m venv env_name
-```
-
-Activate environment
-
-```bash
-source env_name/bin/activate
-```
-
-Install dependencies:
-
-```bash
+python3 -m venv gputok_env
+source gputok_env/bin/activate
 python -m pip install -r requirements.txt
-```
-
-
-For GPU BlockBPE via the pybind11 extension, you also need:
-
-- `ninja` (for `torch.utils.cpp_extension.load`),
-- CUDA toolkit and a working GPU.
-
-Install `ninja` if needed:
-
-```bash
 python -m pip install ninja
 ```
 
-#### 2. Tokenizer scaling benchmark
-
-Runs WikiText‑103 scaling for tiktoken and HF GPT‑2 (GPU BlockBPE is enabled if the extension builds):
+To run the tokenizer scaling benchmark on WikiText‑103:
 
 ```bash
-python benchmark_tokenizer_scaling.py
+~/gpu-tokenizer/gputok_env/bin/python benchmark_tokenizer_scaling.py
 ```
 
-This will:
-
-- Download WikiText‑103,
-- Build prompts at various GPT‑2 token lengths,
-- Print per‑length throughput and summary tables for batch and per‑prompt (latency) modes.
-
-#### 3. Generation quality benchmark
-
-Runs quality comparison on WikiText‑103 (using subprocess GPU tokenizer if the extension cannot be built):
+To run the generation quality benchmark (WikiText‑103, test split):
 
 ```bash
-python compare_generation_quality.py \
+~/gpu-tokenizer/gputok_env/bin/python compare_generation_quality.py \
   --wikitext-split test \
-  --num-prompts 100 \
-  --max-prompt-chars 512 \
-  --ref-chars 512
+  --num-prompts 500 \
+  --max-prompt-chars 384 \
+  --ref-chars 512 \
+  --temperature 0.001
 ```
 
-This will:
+### Nsight Systems profiling (BlockBPE vs optimized)
 
-- Sample 100 (prompt, continuation) pairs from WikiText‑103,
-- Tokenize prompts with GPU BlockBPE, tiktoken, and HF GPT‑2,
-- Generate continuations with GPT‑2,
-- Report averaged similarity scores vs. ground truth.
+We profile both binaries with Nsight Systems to characterize kernel, memory, and API behavior:
 
-### Key benchmark results (from your runs)
+```bash
+module load cuda-13.0
+nsys profile -t cuda,nvtx --stats=true ./gpu_tokenizer_blockbpe 2048 data/input/pride_and_prejudice.txt
+nsys profile -t cuda,nvtx --stats=true ./gpu_tokenizer_blockbpe_optimized 2048 data/input/pride_and_prejudice.txt
+```
 
-#### A. Single-file GPU tokenizer (`Pride and Prejudice`)
+On `pride_and_prejudice.txt` (711,349 initial tokens, 348 chunks, max 2048 tokens/chunk), Nsight reports:
 
-**Input**: `pride_and_prejudice.txt`  
-**Total initial tokens**: 711,349 (348 chunks, max 2048 tokens/chunk)  
-**Default block size**: `BLOCK_SIZE=256`
+- **Kernel timing and throughput (program timers)**
+  - Baseline BlockBPE:
+    - GPU kernel time ≈ **69.3 ms**, CPU BPE time ≈ **12,037 ms**.
+    - Approximate GPU throughput ≈ **1.03×10⁷ tokens/s**, CPU ≈ **5.9×10⁴ tokens/s**, for a **~174×** CPU→GPU speedup.
+  - Optimized BlockBPE:
+    - GPU kernel time ≈ **62.9 ms**, CPU BPE time ≈ **12,107 ms**.
+    - Approximate GPU throughput ≈ **1.13×10⁷ tokens/s**, CPU ≈ **5.9×10⁴ tokens/s**, for a **~192×** CPU→GPU speedup.
 
-| Variant              | CPU BPE time (ms) | GPU kernel time (ms) | CPU tok/s       | GPU tok/s        | CPU→GPU speedup |
-|----------------------|-------------------|----------------------|-----------------|------------------|-----------------|
-| Baseline (`gputok`)  | 41.50             | 4.07                 | 1.71×10⁷        | 1.75×10⁸         | **10.2×**       |
-| Optimized (`gputok_optimized`) | 44.05   | 2.47                 | 1.61×10⁷        | 2.88×10⁸         | **17.9×**       |
+- **CUDA API breakdown (`cuda_api_sum`)**
+  - For both kernels, `cudaMalloc` dominates API time (≈68–82% of total CUDA API time), reflecting the one‑time cost of allocating the large `static_map` and token buffers.
+  - `cudaEventSynchronize` accounts for ≈12–12% of API time, capturing the end-to-end kernel timing.
+  - `cudaFree` contributes 5–19%, while `cudaMemcpy*` and `cudaLaunchKernel` together account for well under 2% of API time, indicating that launch and transfer overheads are negligible relative to allocation and kernel execution.
 
-**Summary**: With the tuned block size, the optimized kernel delivers roughly **1.6×** higher GPU throughput than the baseline (≈1.75e8 → 2.88e8 tokens/s) while keeping outputs identical to the CPU reference.
+- **Kernel summary (`cuda_gpu_kern_sum`)**
+  - In both runs, the BPE merge kernel (`bpe_merge_kernel_blockbpe` / `bpe_merge_kernel_blockbpe_optimized`) accounts for essentially **100%** of GPU kernel time; the only other kernels are small cuCollections and CUB housekeeping kernels.
+  - This confirms that our implementation is compute/memory-bound inside the BPE merge kernel rather than being dominated by overhead kernels.
 
-#### A.1. Nsight Systems profiling (baseline vs optimized, `BLOCK_SIZE=256`)
+- **Memory transfers (`cuda_gpu_mem_time_sum` / `cuda_gpu_mem_size_sum`)**
+  - Host-to-device copies move ≈3.65 MB in 4 calls, with average latencies in the hundreds of microseconds; device-to-host copies move ≈2.85 MB in 3 calls, with similar average latencies.
+  - Memory transfer time accounts for ≤71% of the **GPU memory** time, but only a small fraction of overall application time; the tokenization workload is dominated by device-side work inside the merge kernel and by initial allocations.
 
-Using `nsys profile -t cuda,nvtx --stats=true` on the same workload:
+Overall, the optimized kernel reduces kernel time by ≈9% vs the baseline on this workload, and both deliver more than two orders of magnitude speedup over the CPU implementation while preserving exact token sequences.
 
-- **Measured kernel time (from the program’s timers)**:
-  - Baseline: GPU kernel ≈ **3.9–4.1 ms**, ≈ **1.8×10⁸ tokens/s**.
-  - Optimized: GPU kernel ≈ **2.5–2.8 ms**, ≈ **2.6–2.9×10⁸ tokens/s**.
-  - Across runs, the optimized kernel is reliably **≈1.4–1.6×** faster than baseline, which is consistent with the throughput improvement reported in the main table.
-- **CUDA API breakdown (Nsight `cuda_api_sum`)**:
-  - In both variants, **`cudaMalloc` dominates API time** (≈92–96% of total CUDA API time), reflecting the one‑time cost of allocating the large `static_map` and token buffers.
-  - `cudaLaunchKernel` contributes only **≈0.3–0.6%** of CUDA API time, and `cudaMemcpy*` another few percent, indicating that launch and transfer overheads are negligible compared to kernel execution and setup.
-- **Critical assessment** (is the kernel “healthy”?):
-  - Host‑side behavior (allocations, copies, launch counts) is essentially identical between baseline and optimized builds, so the observed speedup must come from the device code itself:
-    - The **baseline kernel** does a `static_map` lookup twice per merged pair (once for rank, once for new token id).
-    - The **optimized kernel** performs a single lookup per pair, caching both rank and new token id in shared memory and reusing them during compaction.
-  - The fact that kernel time scales cleanly with block size (A.2), and that GPU throughput improves without any loss of correctness, suggests the optimized kernel is effectively exploiting on‑chip memory while remaining primarily memory‑lookup bound rather than launch‑bound—a profile that is typical and acceptable for hash‑table–driven GPU algorithms.
+### WikiText‑103 tokenizer scaling results (updated)
 
-#### A.2. Effect of CUDA block size (baseline vs optimized)
+From our latest run of `benchmark_tokenizer_scaling.py` on WikiText‑103 (latency mode, single sequence), we measure average time vs input length (measured in HuggingFace GPT‑2 tokens):
 
-Using `profile_block_sizes.sh` to sweep `BLOCK_SIZE ∈ {128, 256, 512, 1024}` on the same workload:
+| Len (HF tok) | GPU BlockBPE base | GPU BlockBPE opt | CPU BPE    | tiktoken  | HF GPT‑2 |
+|-------------:|------------------:|-----------------:|-----------:|----------:|---------:|
+|         256  |  96.47 ms         |   5.51 ms        |  3.15 ms   |  2.35 ms  | 10.97 ms |
+|         512  | 287.13 ms         |   9.02 ms        |  6.16 ms   |  4.12 ms  | 20.85 ms |
+|       1,024  | 300.74 ms         |  11.17 ms        | 13.30 ms   |  7.72 ms  | 38.01 ms |
+|       2,048  | 306.08 ms         |  14.13 ms        | 24.49 ms   | 15.39 ms  | 73.16 ms |
+|       4,096  | 314.08 ms         |  20.61 ms        | 50.88 ms   | 29.55 ms  |145.55 ms |
+|       8,192  | 327.61 ms         |  33.56 ms        |100.35 ms   | 59.10 ms  |287.70 ms |
+|      16,384  | 591.11 ms         |  91.33 ms        |205.54 ms   |115.54 ms  |608.38 ms |
+|      32,768  | 431.43 ms         |  88.64 ms        |210.26 ms   |155.39 ms  |671.20 ms |
+|      65,536  | 356.45 ms         | 157.69 ms        |238.61 ms   |159.29 ms  |690.20 ms |
+|     131,072  | 310.14 ms         |  99.99 ms        |212.50 ms   |156.98 ms  |717.50 ms |
 
-| Variant   | Block size | GPU kernel time (ms) | GPU throughput (tokens/s) |
-|-----------|------------|----------------------|---------------------------|
-| baseline  | 128        | 3.99974              | 1.78×10⁸                  |
-| baseline  | 256        | 3.82157              | 1.86×10⁸                  |
-| baseline  | 512        | 5.88902              | 1.21×10⁸                  |
-| baseline  | 1024       | 14.8552              | 4.79×10⁷                  |
-| optimized | 128        | 2.77811              | 2.56×10⁸                  |
-| optimized | 256        | 2.47296              | 2.88×10⁸                  |
-| optimized | 512        | 2.48832              | 2.86×10⁸                  |
-| optimized | 1024       | 6.20134              | 1.15×10⁸                  |
+Speedups of GPU BlockBPE opt vs tiktoken / HF GPT‑2 (from the same run):
 
-**Summary**:
+| Len (HF tok) | opt / tiktoken | opt / HF GPT‑2 | base / tiktoken | base / HF GPT‑2 |
+|-------------:|---------------:|---------------:|----------------:|----------------:|
+|         256  | 0.45×          | 2.09×          | 0.02×           | 0.11×           |
+|         512  | 0.48×          | 2.44×          | 0.01×           | 0.07×           |
+|       1,024  | 0.73×          | 3.60×          | 0.03×           | 0.13×           |
+|       2,048  | 1.15×          | 5.48×          | 0.05×           | 0.24×           |
+|       4,096  | 1.52×          | 7.47×          | 0.09×           | 0.46×           |
+|       8,192  | 1.87×          | 9.08×          | 0.18×           | 0.88×           |
+|      16,384  | 1.34×          | 7.07×          | 0.20×           | 1.03×           |
+|      32,768  | 1.86×          | 8.03×          | 0.36×           | 1.56×           |
+|      65,536  | 1.07×          | 4.65×          | 0.45×           | 1.94×           |
+|     131,072  | 1.67×          | 7.62×          | 0.51×           | 2.32×           |
 
-- For both kernels, very large blocks (1024 threads) **hurt performance**—kernel time grows and throughput drops, likely due to low SM occupancy and shared-memory pressure per block.
-- For the baseline kernel, **256 threads/block** is slightly better than 128 on this GPU; 512+ quickly degrades.
-- For the optimized kernel, **256–512 threads/block** are both near-optimal and clearly better than 128; 1024 is again much worse.
-- In practice, starting with `BLOCK_SIZE=256` is a good default; on GPUs with more registers/SMs, experimenting with 512 may yield a small additional gain.
+In latency mode, the optimized GPU BlockBPE is less efficient than tiktoken on very short inputs, but overtakes it once sequences reach a few thousand tokens and consistently outperforms the HuggingFace GPT‑2 tokenizer by large factors at long context lengths.
 
-#### B. Tokenizer scaling benchmark (WikiText‑103)
+### Generation quality benchmark (WikiText‑103, updated)
 
-With the `gputok_gpu` extension built (using `BLOCK_SIZE=256` under the hood), the scaling benchmark reports GPU BlockBPE, CPU BlockBPE, tiktoken, and HF GPT‑2 throughput.
+From our latest run:
 
-**Batch throughput (tokens/sec, higher is better):**
+```bash
+~/gpu-tokenizer/gputok_env/bin/python compare_generation_quality.py \
+  --wikitext-split test \
+  --num-prompts 500 \
+  --max-prompt-chars 384 \
+  --ref-chars 512 \
+  --temperature 0.001
+```
 
-| HF tokens | GPU BlockBPE (M) | CPU BlockBPE (M) | tiktoken (M) | HF GPT‑2 (M) | GPU/CPU | GPU/TK | GPU/HF |
-|----------:|-----------------:|-----------------:|-------------:|-------------:|--------:|-------:|-------:|
-| 256       | 4.26             | 2.10             | 3.64         | 1.70         | 2.03×   | 1.17×  | 2.50×  |
-| 512       | 4.74             | 2.38             | 3.63         | 2.59         | 1.99×   | 1.31×  | 1.83×  |
-| 1,024     | 5.42             | 2.63             | 3.79         | 3.18         | 2.06×   | 1.43×  | 1.71×  |
-| 2,048     | 6.31             | 2.69             | 4.20         | 4.36         | 2.34×   | 1.50×  | 1.45×  |
-| 4,096     | 8.40             | 2.91             | 4.51         | 3.68         | 2.89×   | 1.86×  | 2.28×  |
-| 8,192     | 7.62             | 2.69             | 4.41         | 3.10         | 2.83×   | 1.73×  | 2.46×  |
-| 16,384    | 7.08             | 2.71             | 4.59         | 1.75         | 2.61×   | 1.54×  | 4.05×  |
-| 32,768    | 6.22             | 2.97             | 4.50         | 0.83         | 2.09×   | 1.38×  | 7.48×  |
+Average similarity vs ground-truth continuation (over 500 prompts):
 
-**Latency-mode throughput (per-prompt, tokens/sec):**
+| Tokenizer            | Character overlap | Word overlap | Sequence similarity |
+|----------------------|------------------:|-------------:|--------------------:|
+| GPU BlockBPE (opt)   | 0.678             | 0.112        | 0.299               |
+| GPU BlockBPE (base)  | 0.685             | 0.113        | 0.303               |
+| tiktoken             | 0.683             | 0.116        | 0.302               |
+| HuggingFace GPT‑2    | 0.683             | 0.116        | 0.302               |
 
-| HF tokens | GPU BlockBPE (M) | CPU BlockBPE (M) | tiktoken (M) | HF GPT‑2 (M) | GPU/CPU | GPU/TK | GPU/HF |
-|----------:|-----------------:|-----------------:|-------------:|-------------:|--------:|-------:|-------:|
-| 256       | 0.47             | 2.08             | 2.55         | 0.75         | 0.22×   | 0.18×  | 0.62×  |
-| 512       | 0.80             | 2.27             | 3.39         | 0.83         | 0.36×   | 0.24×  | 0.97×  |
-| 1,024     | 1.41             | 2.58             | 3.85         | 0.93         | 0.55×   | 0.37×  | 1.52×  |
-| 2,048     | 2.82             | 2.56             | 4.48         | 0.98         | 1.10×   | 0.63×  | 2.88×  |
-| 4,096     | 3.94             | 2.56             | 4.22         | 0.92         | 1.54×   | 0.93×  | 4.27×  |
-| 8,192     | 6.14             | 2.89             | 3.93         | 0.85         | 2.12×   | 1.56×  | 7.24×  |
-| 16,384    | 5.80             | 2.94             | 4.43         | 0.93         | 1.97×   | 1.31×  | 6.24×  |
-| 32,768    | 6.46             | 2.47             | 3.83         | 0.88         | 2.61×   | 1.69×  | 7.33×  |
+All four tokenizers deliver very similar generation quality on WikiText‑103. The base BlockBPE kernel closely matches tiktoken and HuggingFace on the sequence similarity metric, and the optimized kernel is only slightly behind on simple overlap scores, confirming that our byte-level BlockBPE implementation is compatible with GPT‑2’s behavior in practice.
 
-**Summary**: In batch mode, GPU BlockBPE is **2–3× faster than CPU BlockBPE** and consistently faster than both tiktoken and HF GPT‑2, especially at longer lengths. In latency mode, GPU BlockBPE is less efficient for very short prompts but overtakes CPU and HF GPT‑2 once prompts reach a few thousand tokens, and becomes competitive with or faster than tiktoken for long contexts.
+### How our implementation differs from BlockBPE in the paper
 
-#### C. Generation quality benchmark (WikiText‑103, 200 prompts)
+- **Scope and integration**  
+  The BlockBPE paper focuses on a general GPU BPE design; our implementation specifically targets GPT‑2’s byte encoder and merges, and integrates tightly with PyTorch via a pybind11 extension so that we can benchmark against `tiktoken` and HuggingFace tokenizers in real LLM workflows.
 
-Average similarity vs ground‑truth continuation (over 200 prompts):
+- **Greedy global-min merge vs parallel local-merge rule**  
+  The original BlockBPE design emphasizes highly parallel merge passes with non-overlapping local merges based on neighboring ranks [BlockBPE paper](https://arxiv.org/pdf/2507.11941). In this project, we deliberately implement the **fully greedy Algorithm 1 semantics** (global minimal rank, left-most occurrence) both on CPU and in our GPU kernels, so that CPU and GPU match token-for-token and align precisely with GPT‑2’s training-time semantics.
 
-| Tokenizer     | Char overlap | Word overlap | Seq similarity |
-|---------------|-------------:|-------------:|---------------:|
-| GPU BlockBPE  | 0.712        | 0.113        | 0.300          |
-| tiktoken      | 0.695        | 0.114        | 0.300          |
-| HuggingFace   | 0.717        | 0.118        | 0.299          |
+- **Kernel structure and optimization choices**  
+  While we share several design choices with BlockBPE (one block per string, use of cuCollections and CCCL), we introduce a simplified double-buffered compaction scheme in the optimized kernel and keep per-chunk control flow very close to the CPU reference. This makes it easier to reason about correctness and to validate equality against CPU results, at the cost of slightly less aggressive intra-pass parallelism than the most fine-grained BlockBPE designs.
 
-**Summary**: All three tokenizers produce **very similar** generation quality. The HF tokenizer is slightly ahead on the simple overlap metrics; GPU BlockBPE matches tiktoken on sequence similarity and stays very close overall, confirming that the custom GPU BPE is compatible with GPT‑2’s behavior in practice.
-
-### How the GPU algorithm differs from naive byte-level BPE
-
-- **Naive byte-level BPE** (typical CPU implementation):
-  - Treats the text as one long token sequence and repeatedly scans it left‑to‑right.
-  - Each iteration finds mergeable pairs and rebuilds the sequence, largely sequentially.
-  - Parallelism is limited and most work happens on scalar CPU state.
-- **Current GPU BlockBPE-style algorithm**:
-  - Splits long texts into fixed‑size chunks and assigns one CUDA block per chunk, enabling many sequences to be processed in parallel.
-  - Within a block, threads:
-    - Look up all adjacent pairs in a GPU `static_map`, writing ranks (and, in the optimized kernel, new token ids) into shared memory.
-    - Apply a **local non‑overlapping merge rule** based on neighboring ranks, then compact the sequence in-place in shared memory.
-  - This design maximizes shared‑memory reuse, minimizes redundant hash lookups (in the optimized kernel), and turns BPE into a highly parallel, GPU‑friendly procedure rather than a naive sequential byte‑level loop.
-
-
+- **Empirical focus**  
+  Our experiments emphasize end-to-end LLM-serving relevance: we report detailed latency vs length curves, direct comparisons against `tiktoken` and HuggingFace GPT‑2, similarity-based generation quality on WikiText‑103, and Nsight-based profiling of kernel and API behavior. This complements the BlockBPE paper’s broader algorithmic analysis by grounding the design in concrete GPT‑2-style workloads.

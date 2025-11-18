@@ -1,31 +1,36 @@
-// GPU Byte-level BPE Tokenizer (Block-style) using cuCollections
+// GPU Byte-level BPE Tokenizer implementing the BlockBPE algorithm
+// as described in "BlockBPE: Parallel BPE Tokenization"
 //
-// High-level design:
-// - Implements a byte-level BPE tokenizer similar in spirit to BlockBPE:
-//   * No regex pre-tokenization, we operate directly on bytes.
-//   * Uses GPT-2 style byte encoder to map bytes -> initial symbol alphabet.
-//   * Builds BPE merge table from GPT-2 `merges.txt`.
-//   * Stores (token_a, token_b) -> (rank, new_token_id) in a GPU-resident
-//     cuco::static_map for fast pair lookup in kernels.
-//   * Performs parallel merge passes inside each CUDA block over sequences.
-// - Also implements a CPU reference tokenizer that uses the same merge policy
-//   as the GPU kernel (local, non-overlapping merges selected by rank).
-// - The main() function:
-//   * Loads merges from data/gpt2_tokenizer/merges.txt
-//   * Reads input lines from data/input/input.txt
-//   * Encodes them to initial tokens with GPT-2 byte encoder
-//   * Runs CPU and GPU BPE, checks for equality, and times both.
+// This variant differs from gputok.cu in two key ways:
+//   1. BPE merge semantics strictly follow Algorithm 1 in the paper:
+//      - In each iteration, find the adjacent pair with the *globally*
+//        lowest merge rank over the sequence.
+//      - Merge the *left-most* occurrence of that pair only.
+//      - Repeat until no such pair exists.
+//   2. The GPU kernel mirrors this semantics and follows the BlockBPE
+//      implementation choices:
+//      - One CUDA block per sequence (chunk).
+//      - Each merge pass:
+//          * All threads scan subsets of adjacent pairs, computing local
+//            best (rank, position).
+//          * A block-wide reduction computes the global best pair
+//            (minimal rank, left-most position).
+//          * Threads build a 0/1 "merge" mask and use a CCCL/CUB
+//            BlockScan to compute per-token write indices and compact
+//            the sequence inside shared memory.
+//      - The CPU reference implementation uses the same greedy rule,
+//        and we check for exact CPU vs GPU token equality.
 //
-// NOTE:
-// - We intentionally do NOT rely on vocab.json contents to keep parsing simple.
-//   Instead, we reconstruct the GPT-2 style byte encoder algorithmically and
-//   derive a token ID space purely from the base alphabet + merges list.
-// - This is sufficient to reproduce the BlockBPE-style GPU algorithm and
-//   compare CPU vs GPU behavior and throughput.
+// We still:
+//   - Use GPT-2 style byte encoder to map bytes -> initial symbol alphabet.
+//   - Build BPE vocabulary and merge table from GPT-2 `merges.txt`.
+//   - Use cuCollections `static_map` for (token_a, token_b) -> (rank, new_token).
+//   - Use CCCL's CUB block primitives for the block-wide prefix scan.
 
 #include <cuco/static_map.cuh>
 
 #include <cuda_runtime.h>
+#include <cub/block/block_scan.cuh>
 
 #include <algorithm>
 #include <chrono>
@@ -40,7 +45,7 @@
 #include <utility>
 #include <vector>
 
-// ---------------------- Utility: CUDA error checking -----------------------
+// ---------------------- Utility: CUDA error checking -------------------------
 
 inline void check_cuda(cudaError_t err, const char* msg)
 {
@@ -50,24 +55,11 @@ inline void check_cuda(cudaError_t err, const char* msg)
   }
 }
 
-// ----------------- GPT-2 style byte encoder reconstruction -----------------
+// ----------------- GPT-2 style byte encoder reconstruction -------------------
 //
 // This reproduces the Python logic used by GPT-2 to build a reversible mapping
 // from bytes 0..255 to a "safe" set of unicode chars (to make BPE operate at
 // the byte level while staying Unicode-friendly).
-//
-// Python reference:
-//   bs = list(range(ord("!"), ord("~")+1)) + \
-//        list(range(ord("¡"), ord("¬")+1)) + \
-//        list(range(ord("®"), ord("ÿ")+1))
-//   cs = bs[:]
-//   n = 0
-//   for b in range(256):
-//       if b not in bs:
-//           bs.append(b)
-//           cs.append(256+n)
-//           n += 1
-//   byte_encoder = dict(zip(bs, [chr(c) for c in cs]))
 
 std::string codepoint_to_utf8(int codepoint)
 {
@@ -133,15 +125,15 @@ struct ByteEncoder {
   }
 };
 
-// -------------------------- BPE vocabulary / merges ------------------------
+// -------------------------- BPE vocabulary / merges --------------------------
 
 struct PairInfo {
   std::uint32_t rank;
   std::int32_t new_token;
 };
 
-using PairKey  = std::uint64_t;  // pack (token_a, token_b)
-using PairVal  = std::uint64_t;  // pack (rank, new_token)
+using PairKey    = std::uint64_t;  // pack (token_a, token_b)
+using PairVal    = std::uint64_t;  // pack (rank, new_token)
 using CpuPairMap = std::unordered_map<PairKey, PairInfo>;
 
 __host__ __device__ inline PairKey pack_pair(std::int32_t a, std::int32_t b)
@@ -243,69 +235,60 @@ void build_vocab_and_merges(const std::string& merges_path, BPEVocab& vocab, con
             << ", vocab size: " << vocab.id_to_token.size() << std::endl;
 }
 
-// ------------------------------ CPU BPE ------------------------------------
+// ------------------------------ CPU BPE (greedy) -----------------------------
+//
+// Exact implementation of Algorithm 1 from the BlockBPE paper:
+//   - While there exists a mergeable pair in the sequence:
+//       * Find the pair (a, b) occurring in the sequence whose merge rank
+//         in the table is minimal.
+//       * Among occurrences of that pair in the sequence, merge the
+//         left-most occurrence only.
+//   - Repeat until no such pair exists.
 
-void bpe_merge_cpu(std::vector<std::int32_t>& tokens,
-                   CpuPairMap const& pair_map,
-                   int max_iters = 50)
+void bpe_merge_cpu_greedy(std::vector<std::int32_t>& tokens,
+                          CpuPairMap const& pair_map,
+                          int /*max_iters_hint*/ = 0)
 {
   if (tokens.empty()) return;
 
   constexpr std::uint32_t INF_RANK = std::numeric_limits<std::uint32_t>::max();
 
-  bool changed = true;
-  int iter     = 0;
-  while (changed && iter < max_iters) {
+  while (true) {
     int n = static_cast<int>(tokens.size());
     if (n < 2) break;
 
-    std::vector<std::uint32_t> ranks(n - 1, INF_RANK);
+    std::uint32_t best_rank = INF_RANK;
+    int best_pos            = -1;
+    PairInfo best_info{};
 
-    // 1. Compute ranks for each adjacent pair
+    // 1. Find globally best pair (lowest rank) and left-most occurrence
     for (int i = 0; i < n - 1; ++i) {
       PairKey key = pack_pair(tokens[i], tokens[i + 1]);
       auto it     = pair_map.find(key);
-      if (it != pair_map.end()) {
-        ranks[i] = it->second.rank;
+      if (it == pair_map.end()) continue;
+
+      const auto& info = it->second;
+      if (info.rank < best_rank) {
+        best_rank = info.rank;
+        best_pos  = i;
+        best_info = info;
       }
+      // If ranks are unique (as in GPT-2 merges), no tie-break is needed
     }
 
-    // 2. Decide which positions to merge using non-overlapping, rank-based rule
-    std::vector<char> merge_here(n - 1, 0);
-    changed = false;
-
-    for (int i = 0; i < n - 1; ++i) {
-      auto r = ranks[i];
-      if (r == INF_RANK) continue;
-
-      // Left neighbor has strictly better rank -> don't merge here
-      if (i > 0 && ranks[i - 1] < r) continue;
-      // Right neighbor has better or equal rank -> don't merge here
-      if (i + 1 < n - 1 && ranks[i + 1] <= r) continue;
-
-      merge_here[i] = 1;
-      changed       = true;
+    if (best_pos < 0) {
+      // No mergeable pair exists
+      break;
     }
 
-    if (!changed) break;
-
-    // 3. Build new token sequence
+    // 2. Merge the left-most occurrence at best_pos
     std::vector<std::int32_t> new_tokens;
-    new_tokens.reserve(n);
+    new_tokens.reserve(n - 1);
 
-    int i = 0;
-    while (i < n) {
-      if (i < n - 1 && merge_here[i]) {
-        PairKey key = pack_pair(tokens[i], tokens[i + 1]);
-        auto it     = pair_map.find(key);
-        if (it == pair_map.end()) {
-          // Fallback: no merge (should not happen)
-          new_tokens.push_back(tokens[i]);
-          ++i;
-        } else {
-          new_tokens.push_back(it->second.new_token);
-          i += 2;
-        }
+    for (int i = 0; i < n;) {
+      if (i == best_pos) {
+        new_tokens.push_back(best_info.new_token);
+        i += 2;  // skip tokens[i+1]
       } else {
         new_tokens.push_back(tokens[i]);
         ++i;
@@ -313,24 +296,42 @@ void bpe_merge_cpu(std::vector<std::int32_t>& tokens,
     }
 
     tokens.swap(new_tokens);
-    ++iter;
   }
 }
 
-// -------------------------- GPU BPE with cuCollections ---------------------
+// -------------------------- GPU BPE with cuCollections -----------------------
 
-using PairProbing   = cuco::linear_probing<1, cuco::default_hash_function<PairKey>>;
-using DevicePairMap = cuco::static_map<PairKey, PairVal, cuco::extent<std::size_t>, cuda::thread_scope_device, cuda::std::equal_to<PairKey>, PairProbing>;
+using PairProbing      = cuco::linear_probing<1, cuco::default_hash_function<PairKey>>;
+using DevicePairMap    = cuco::static_map<PairKey,
+                                       PairVal,
+                                       cuco::extent<std::size_t>,
+                                       cuda::thread_scope_device,
+                                       cuda::std::equal_to<PairKey>,
+                                       PairProbing>;
 using DevicePairMapRef = decltype(std::declval<DevicePairMap>().ref(cuco::find));
 
-__global__ void bpe_merge_kernel(DevicePairMapRef map_ref,
-                                 const std::int32_t* __restrict__ d_tokens_in,
-                                 const int* __restrict__ d_offsets,
-                                 const int* __restrict__ d_lengths,
-                                 std::int32_t* __restrict__ d_tokens_out,
-                                 int* __restrict__ d_out_lengths,
-                                 int max_seq_len,
-                                 int max_iters)
+#ifndef BLOCK_SIZE
+#define BLOCK_SIZE 512
+#endif
+
+using BlockScan = cub::BlockScan<int, BLOCK_SIZE>;
+
+// Kernel that mirrors Algorithm 1 on GPU:
+//   - One block per sequence.
+//   - Each iteration:
+//       * All threads scan subsets of adjacent pairs to find their local
+//         best (rank, position).
+//       * A block-wide reduction yields the global best (rank, position).
+//       * If a merge exists, we merge that single pair and shift tokens
+//         left in parallel.
+
+__global__ void bpe_merge_kernel_blockbpe(DevicePairMapRef map_ref,
+                                          const std::int32_t* __restrict__ d_tokens_in,
+                                          const int* __restrict__ d_offsets,
+                                          const int* __restrict__ d_lengths,
+                                          std::int32_t* __restrict__ d_tokens_out,
+                                          int* __restrict__ d_out_lengths,
+                                          int max_seq_len)
 {
   int seq_id = blockIdx.x;
   int tid    = threadIdx.x;
@@ -340,123 +341,203 @@ __global__ void bpe_merge_kernel(DevicePairMapRef map_ref,
   if (len <= 0 || len > max_seq_len) return;
 
   extern __shared__ unsigned char smem[];
-  std::int32_t* sh_tokens     = reinterpret_cast<std::int32_t*>(smem);
-  std::uint32_t* sh_ranks     = reinterpret_cast<std::uint32_t*>(sh_tokens + max_seq_len);
-  unsigned char* sh_mergehere = reinterpret_cast<unsigned char*>(sh_ranks + max_seq_len);
+  // Double-buffered shared-storage for tokens: [in | out]
+  std::int32_t* sh_tokens_in  = reinterpret_cast<std::int32_t*>(smem);
+  std::int32_t* sh_tokens_out = sh_tokens_in + max_seq_len;
 
   __shared__ int sh_len;
-  __shared__ int sh_changed;
 
   // Load tokens into shared memory
   for (int i = tid; i < len; i += blockDim.x) {
-    sh_tokens[i] = d_tokens_in[offset + i];
+    sh_tokens_in[i] = d_tokens_in[offset + i];
   }
 
   if (tid == 0) {
-    sh_len     = len;
-    sh_changed = 1;
+    sh_len = len;
   }
   __syncthreads();
 
   const std::uint32_t INF_RANK = 0xFFFFFFFFu;
 
-  int iter = 0;
-  while (iter < max_iters) {
-    if (sh_len < 2) break;
+  // Scratch for block-wide argmin reduction and block-scan
+  __shared__ std::uint32_t sh_best_rank[BLOCK_SIZE];
+  __shared__ int           sh_best_pos[BLOCK_SIZE];
+  __shared__ PairInfo      sh_best_info;
+  __shared__ typename BlockScan::TempStorage scan_storage;
 
-    // Reset changed flag
-    if (tid == 0) sh_changed = 0;
-    __syncthreads();
-
+  while (true) {
     int cur_len = sh_len;
+    if (cur_len < 2) break;
 
-    // 1. Compute ranks for each adjacent pair
+    // 1. Each thread scans a strided subset of pairs to find its local best
+    std::uint32_t local_best_rank = INF_RANK;
+    int           local_best_pos  = -1;
+
     for (int i = tid; i < cur_len - 1; i += blockDim.x) {
-      PairKey key = pack_pair(sh_tokens[i], sh_tokens[i + 1]);
-      auto it     = map_ref.find(key);
-      if (it != map_ref.end()) {
-        PairVal v      = (*it).second;
-        PairInfo info  = unpack_val(v);
-        sh_ranks[i]    = info.rank;
-      } else {
-        sh_ranks[i] = INF_RANK;
+      PairKey key = pack_pair(sh_tokens_in[i], sh_tokens_in[i + 1]);
+      auto    it  = map_ref.find(key);
+      if (it == map_ref.end()) continue;
+
+      PairVal v     = (*it).second;
+      PairInfo info = unpack_val(v);
+
+      if (info.rank < local_best_rank) {
+        local_best_rank = info.rank;
+        local_best_pos  = i;
       }
     }
 
-    // For convenience, set last rank to INF (no pair)
-    if (tid == 0 && cur_len - 1 >= 0) {
-      sh_ranks[cur_len - 1] = INF_RANK;
-    }
+    // 2. Block-wide argmin reduction on (rank, position), breaking ties
+    //    by choosing the left-most position.
+    sh_best_rank[tid] = local_best_rank;
+    sh_best_pos[tid]  = local_best_pos;
     __syncthreads();
 
-    // 2. Decide which positions to merge
-    for (int i = tid; i < cur_len - 1; i += blockDim.x) {
-      std::uint32_t r = sh_ranks[i];
-      unsigned char m = 0;
-      if (r != INF_RANK) {
-        if (i > 0 && sh_ranks[i - 1] < r) {
-          m = 0;
-        } else if (i + 1 < cur_len - 1 && sh_ranks[i + 1] <= r) {
-          m = 0;
-        } else {
-          m = 1;
-        }
-      }
-      sh_mergehere[i] = m;
-      if (m) {
-        atomicExch(&sh_changed, 1);
-      }
-    }
-    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        std::uint32_t r1 = sh_best_rank[tid];
+        int           p1 = sh_best_pos[tid];
+        std::uint32_t r2 = sh_best_rank[tid + stride];
+        int           p2 = sh_best_pos[tid + stride];
 
-    if (sh_changed == 0) {
-      break;  // no merges this iteration
-    }
-
-    // 3. Sequential compaction per block (small per-sequence lengths)
-    if (tid == 0) {
-      int write_idx = 0;
-      int i         = 0;
-      while (i < cur_len) {
-        if (i < cur_len - 1 && sh_mergehere[i]) {
-          PairKey key = pack_pair(sh_tokens[i], sh_tokens[i + 1]);
-          auto it     = map_ref.find(key);
-          if (it != map_ref.end()) {
-            PairVal v     = (*it).second;
-            PairInfo info = unpack_val(v);
-            sh_tokens[write_idx++] = info.new_token;
-            i += 2;
-          } else {
-            // Fallback: no merge
-            sh_tokens[write_idx++] = sh_tokens[i];
-            ++i;
+        bool take_r2 = false;
+        if (r2 < r1) {
+          take_r2 = true;
+        } else if (r2 == r1) {
+          // Both INF or same rank; prefer valid and left-most position.
+          if (p2 >= 0 && (p1 < 0 || p2 < p1)) {
+            take_r2 = true;
           }
-        } else if (i > 0 && sh_mergehere[i - 1]) {
-          // This position was merged with previous, skip
-          ++i;
-        } else {
-          sh_tokens[write_idx++] = sh_tokens[i];
-          ++i;
+        }
+
+        if (take_r2) {
+          sh_best_rank[tid] = r2;
+          sh_best_pos[tid]  = p2;
         }
       }
-      sh_len = write_idx;
+      __syncthreads();
+    }
+
+    std::uint32_t best_rank = sh_best_rank[0];
+    int           best_pos  = sh_best_pos[0];
+
+    // 3. If no mergeable pair exists, we are done.
+    if (best_pos < 0 || best_rank == INF_RANK) {
+      break;
+    }
+
+    // 4. Look up the new token id for the best pair once (by thread 0)
+    if (tid == 0) {
+      PairKey key = pack_pair(sh_tokens_in[best_pos], sh_tokens_in[best_pos + 1]);
+      auto    it  = map_ref.find(key);
+      if (it != map_ref.end()) {
+        PairVal v = (*it).second;
+        sh_best_info = unpack_val(v);
+      } else {
+        // Fallback (should not happen if maps are consistent)
+        sh_best_info.rank      = best_rank;
+        sh_best_info.new_token = sh_tokens_in[best_pos];
+      }
     }
     __syncthreads();
 
-    ++iter;
+    // 5. Compaction step
+    //
+    // We support two regimes:
+    //   (a) cur_len <= blockDim.x: use CCCL/CUB BlockScan to compact
+    //       the sequence in a single pass over the block.
+    //   (b) cur_len > blockDim.x: use thread coarsening (each thread
+    //       strides over the string with step = blockDim.x) to perform
+    //       the shift by 1 for all positions after best_pos+1.
+
+    if (cur_len <= blockDim.x) {
+      // 5a. Build 0/1 merge flags and use a block-wide prefix scan
+      //     (CCCL/CUB) to compute write indices and compact into
+      //     sh_tokens_out.
+      int flag = 0;
+      int val  = 0;
+      if (tid < cur_len) {
+        val = sh_tokens_in[tid];
+        if (tid == best_pos) {
+          // This position becomes the merged token
+          val = sh_best_info.new_token;
+        } else if (tid == best_pos + 1) {
+          // This token is removed
+          flag = 1;
+        }
+      }
+
+      int prefix    = 0;
+      int block_sum = 0;
+      BlockScan(scan_storage).ExclusiveSum(flag, prefix, block_sum);
+      __syncthreads();
+
+      if (tid < cur_len && flag == 0) {
+        int dst = tid - prefix;  // removed elements to the left
+        sh_tokens_out[dst] = val;
+      }
+      __syncthreads();
+
+      if (tid == 0) {
+        sh_len = cur_len - block_sum;  // should be cur_len - 1
+      }
+      __syncthreads();
+
+      // Swap buffers for next iteration
+      std::int32_t* tmp = sh_tokens_in;
+      sh_tokens_in      = sh_tokens_out;
+      sh_tokens_out     = tmp;
+      __syncthreads();
+    } else {
+      // 5b. Thread-coarsened compaction for long sequences.
+      //
+      // We use a double-buffered scheme to avoid in-place hazards:
+      //   - Read from sh_tokens_in, write to sh_tokens_out.
+      //   - Each thread processes indices idx = tid, idx += blockDim.x.
+      //   - The mapping for a single merged pair (best_pos, best_pos+1) is:
+      //       * idx == best_pos     -> write new_token at dst = best_pos
+      //       * idx == best_pos + 1 -> dropped
+      //       * idx <  best_pos + 1 -> dst = idx
+      //       * idx >  best_pos + 1 -> dst = idx - 1
+      for (int idx = tid; idx < cur_len; idx += blockDim.x) {
+        if (idx == best_pos + 1) {
+          continue;  // removed token
+        }
+
+        int val = sh_tokens_in[idx];
+        if (idx == best_pos) {
+          val = sh_best_info.new_token;
+        }
+
+        int dst = (idx <= best_pos) ? idx : (idx - 1);
+        sh_tokens_out[dst] = val;
+      }
+      __syncthreads();
+
+      if (tid == 0) {
+        sh_len = cur_len - 1;
+      }
+      __syncthreads();
+
+      // Swap buffers for next iteration
+      std::int32_t* tmp = sh_tokens_in;
+      sh_tokens_in      = sh_tokens_out;
+      sh_tokens_out     = tmp;
+      __syncthreads();
+    }
   }
 
   // Write back output tokens and length
   len = sh_len;
   for (int i = tid; i < len; i += blockDim.x) {
-    d_tokens_out[offset + i] = sh_tokens[i];
+    d_tokens_out[offset + i] = sh_tokens_in[i];
   }
   if (tid == 0) {
     d_out_lengths[seq_id] = len;
   }
 }
 
-// ---------------------------- I/O helpers ----------------------------------
+// ---------------------------- I/O helpers ------------------------------------
 
 std::vector<std::string> read_lines(const std::string& path, int max_lines = 1000)
 {
@@ -482,7 +563,7 @@ std::vector<std::int32_t> encode_text_to_tokens(const std::string& text,
 
   for (unsigned char c : text) {
     const std::string& sym = enc.byte_to_symbol[static_cast<int>(c)];
-    auto it               = vocab.token_to_id.find(sym);
+    auto               it  = vocab.token_to_id.find(sym);
     if (it == vocab.token_to_id.end()) {
       throw std::runtime_error("Byte encoder symbol not found in vocab");
     }
@@ -491,17 +572,17 @@ std::vector<std::int32_t> encode_text_to_tokens(const std::string& text,
   return tokens;
 }
 
-// ----------------------------- Main driver ---------------------------------
+// ----------------------------- Main driver -----------------------------------
 
 int main(int argc, char** argv)
 {
   try {
     const std::string merges_path = "data/gpt2_tokenizer/merges.txt";
     // Default input path; can be overridden via argv[2]
-    std::string input_path  = "data/input/pride_and_prejudice.txt";
+    std::string input_path = "data/input/pride_and_prejudice.txt";
 
     ByteEncoder encoder;
-    BPEVocab vocab;
+    BPEVocab   vocab;
     build_vocab_and_merges(merges_path, vocab, encoder);
 
     // Optional command-line arg: chunk size in tokens (default 2048)
@@ -555,8 +636,8 @@ int main(int argc, char** argv)
 
     // Flatten sequences for GPU
     int num_seqs = static_cast<int>(cpu_seqs.size());
-    std::vector<int> h_offsets(num_seqs);
-    std::vector<int> h_lengths(num_seqs);
+    std::vector<int>          h_offsets(num_seqs);
+    std::vector<int>          h_lengths(num_seqs);
     std::vector<std::int32_t> h_tokens_flat;
 
     int offset = 0;
@@ -571,9 +652,8 @@ int main(int argc, char** argv)
 
     std::cerr << "Total initial tokens: " << total_tokens << std::endl;
 
-    // Build CPU pair map already inside vocab.cpu_pairs
     // Prepare GPU static_map for pair->(rank,new_token)
-    std::size_t num_pairs = vocab.cpu_pairs.size();
+    std::size_t num_pairs   = vocab.cpu_pairs.size();
     double      load_factor = 0.5;
     std::size_t capacity    = static_cast<std::size_t>(std::ceil(num_pairs / load_factor));
     PairKey     empty_key   = std::numeric_limits<PairKey>::max();
@@ -612,9 +692,9 @@ int main(int argc, char** argv)
     // Allocate device buffers for tokens/offsets/lengths
     std::int32_t* d_tokens_in  = nullptr;
     std::int32_t* d_tokens_out = nullptr;
-    int* d_offsets             = nullptr;
-    int* d_lengths             = nullptr;
-    int* d_out_lengths         = nullptr;
+    int*          d_offsets    = nullptr;
+    int*          d_lengths    = nullptr;
+    int*          d_out_lengths = nullptr;
 
     check_cuda(cudaMalloc(&d_tokens_in, total_tokens * sizeof(std::int32_t)), "cudaMalloc tokens_in");
     check_cuda(cudaMalloc(&d_tokens_out, total_tokens * sizeof(std::int32_t)), "cudaMalloc tokens_out");
@@ -638,48 +718,43 @@ int main(int argc, char** argv)
                           cudaMemcpyHostToDevice),
                "cudaMemcpy lengths");
 
-    // CPU BPE timing
+    // CPU BPE timing (greedy Algorithm 1)
     auto cpu_tokens_merged = cpu_seqs;  // copy
     auto cpu_start         = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < num_seqs; ++i) {
-      bpe_merge_cpu(cpu_tokens_merged[i], vocab.cpu_pairs);
+      bpe_merge_cpu_greedy(cpu_tokens_merged[i], vocab.cpu_pairs);
     }
-    auto cpu_end = std::chrono::high_resolution_clock::now();
+    auto  cpu_end = std::chrono::high_resolution_clock::now();
     double cpu_ms =
       std::chrono::duration_cast<std::chrono::microseconds>(cpu_end - cpu_start).count() / 1000.0;
 
-    // GPU BPE timing
-#ifndef BLOCK_SIZE
-#define BLOCK_SIZE 256
-#endif
+    // GPU BPE timing (BlockBPE-style greedy kernel)
     int block_size = BLOCK_SIZE;
     int grid_size  = num_seqs;
-    int max_iters  = 50;
 
     std::size_t shared_bytes =
-      static_cast<std::size_t>(max_seq_len) *
-      (sizeof(std::int32_t) + sizeof(std::uint32_t) + sizeof(unsigned char));
+      static_cast<std::size_t>(2) * static_cast<std::size_t>(max_seq_len) * sizeof(std::int32_t);
 
     cudaEvent_t ev_start, ev_end;
     cudaEventCreate(&ev_start);
     cudaEventCreate(&ev_end);
 
     cudaEventRecord(ev_start);
-    bpe_merge_kernel<<<grid_size, block_size, shared_bytes>>>(
-      d_map_ref, d_tokens_in, d_offsets, d_lengths, d_tokens_out, d_out_lengths, max_seq_len, max_iters);
+    bpe_merge_kernel_blockbpe<<<grid_size, block_size, shared_bytes>>>(
+      d_map_ref, d_tokens_in, d_offsets, d_lengths, d_tokens_out, d_out_lengths, max_seq_len);
     cudaEventRecord(ev_end);
     cudaEventSynchronize(ev_end);
     float gpu_ms = 0.0f;
     cudaEventElapsedTime(&gpu_ms, ev_start, ev_end);
 
-    check_cuda(cudaGetLastError(), "bpe_merge_kernel");
+    check_cuda(cudaGetLastError(), "bpe_merge_kernel_blockbpe");
 
     cudaEventDestroy(ev_start);
     cudaEventDestroy(ev_end);
 
     // Copy GPU outputs back
     std::vector<std::int32_t> h_tokens_out(total_tokens);
-    std::vector<int> h_out_lengths(num_seqs);
+    std::vector<int>          h_out_lengths(num_seqs);
     check_cuda(cudaMemcpy(h_tokens_out.data(),
                           d_tokens_out,
                           total_tokens * sizeof(std::int32_t),
@@ -705,40 +780,68 @@ int main(int argc, char** argv)
 
       if (static_cast<int>(cpu_tokens_merged[i].size()) != len) {
         all_ok = false;
-        std::cerr << "Length mismatch in sequence " << i << ": CPU "
+        std::cerr << "[Seq " << i << "] Length mismatch: CPU "
                   << cpu_tokens_merged[i].size() << " vs GPU " << len << std::endl;
+
+        // Print a small prefix of both sequences for debugging
+        int debug_len = std::min<int>(static_cast<int>(cpu_tokens_merged[i].size()), len);
+        debug_len     = std::min(debug_len, 64);
+        std::cerr << "CPU tokens (prefix up to " << debug_len << "): ";
+        for (int j = 0; j < debug_len; ++j) {
+          std::cerr << cpu_tokens_merged[i][j] << " ";
+        }
+        std::cerr << std::endl;
+        std::cerr << "GPU tokens (prefix up to " << debug_len << "): ";
+        for (int j = 0; j < debug_len; ++j) {
+          std::cerr << gpu_seq[j] << " ";
+        }
+        std::cerr << std::endl;
         break;
       }
 
       for (int j = 0; j < len; ++j) {
         if (cpu_tokens_merged[i][j] != gpu_seq[j]) {
           all_ok = false;
-          std::cerr << "Token mismatch in sequence " << i << " at position " << j << ": CPU "
-                    << cpu_tokens_merged[i][j] << " vs GPU " << gpu_seq[j] << std::endl;
+          std::cerr << "[Seq " << i << "] Token mismatch at position " << j
+                    << ": CPU " << cpu_tokens_merged[i][j]
+                    << " vs GPU " << gpu_seq[j] << std::endl;
+
+          int debug_len = std::min<int>(len, j + 32);
+          debug_len     = std::min(debug_len, 128);
+          std::cerr << "CPU tokens (prefix up to " << debug_len << "): ";
+          for (int k = 0; k < debug_len && k < static_cast<int>(cpu_tokens_merged[i].size()); ++k) {
+            std::cerr << cpu_tokens_merged[i][k] << " ";
+          }
+          std::cerr << std::endl;
+          std::cerr << "GPU tokens (prefix up to " << debug_len << "): ";
+          for (int k = 0; k < debug_len; ++k) {
+            std::cerr << gpu_seq[k] << " ";
+          }
+          std::cerr << std::endl;
           break;
         }
       }
       if (!all_ok) break;
     }
 
-    std::cout << "CPU BPE time: " << cpu_ms << " ms" << std::endl;
-    std::cout << "GPU BPE kernel time (excl. H2D/D2H): " << gpu_ms << " ms" << std::endl;
+    std::cout << "CPU BPE (greedy Algorithm 1) time: " << cpu_ms << " ms" << std::endl;
+    std::cout << "GPU BlockBPE-style greedy kernel time (excl. H2D/D2H): "
+              << gpu_ms << " ms" << std::endl;
     if (gpu_ms > 0.0f) {
-      double speedup      = cpu_ms / gpu_ms;
+      double speedup       = cpu_ms / gpu_ms;
       double gpu_tok_per_s = (static_cast<double>(total_tokens) / (gpu_ms / 1000.0));
       double cpu_tok_per_s = (static_cast<double>(total_tokens) / (cpu_ms / 1000.0));
-      std::cout << "Approximate speedup (CPU / GPU kernel): " << speedup << "x" << std::endl;
+      std::cout << "Approximate speedup (CPU / GPU greedy kernel): " << speedup << "x" << std::endl;
       std::cout << "CPU throughput: " << cpu_tok_per_s << " tokens/s" << std::endl;
-      std::cout << "GPU kernel throughput: " << gpu_tok_per_s << " tokens/s" << std::endl;
+      std::cout << "GPU greedy kernel throughput: " << gpu_tok_per_s << " tokens/s" << std::endl;
     }
-    std::cout << "CPU vs GPU token match: " << (all_ok ? "OK" : "MISMATCH") << std::endl;
+    std::cout << "CPU vs GPU token match (greedy Algorithm 1): "
+              << (all_ok ? "OK" : "MISMATCH") << std::endl;
 
     // Write final tokenized output (GPU result) to file in data/output.
-    // Each line corresponds to one input line; tokens are written as their
-    // textual BPE pieces (e.g., \"ĠThe\"), space-separated.
     {
-      const std::string out_path = "data/output/gpu_tokens.txt";
-      std::ofstream out(out_path);
+      const std::string out_path = "data/output/gpu_tokens_blockbpe.txt";
+      std::ofstream     out(out_path);
       if (!out) {
         std::cerr << "Failed to open output file for writing: " << out_path << std::endl;
       } else {
@@ -757,7 +860,7 @@ int main(int argc, char** argv)
           }
           out << '\n';
         }
-        std::cerr << "Wrote GPU tokens to " << out_path << std::endl;
+        std::cerr << "Wrote GPU BlockBPE tokens to " << out_path << std::endl;
       }
     }
 
@@ -775,5 +878,6 @@ int main(int argc, char** argv)
     return 1;
   }
 }
+
 
 

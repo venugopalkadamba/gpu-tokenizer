@@ -16,12 +16,8 @@ Reports:
 """
 
 import argparse
-import subprocess
-import tempfile
-import shutil
 from pathlib import Path
-import re
-from typing import Optional, List, Tuple
+from typing import List, Tuple
 
 try:
     import tiktoken
@@ -47,108 +43,6 @@ try:
     from torch.utils.cpp_extension import load as load_extension  # type: ignore
 except ImportError:
     load_extension = None
-
-
-def load_gpu_token_strings(path: Path) -> List[str]:
-    """Load token strings from GPU tokenizer output file."""
-    if not path.exists():
-        raise FileNotFoundError(f"GPU token file not found: {path}")
-    
-    tokens = []
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                tokens.extend(line.split())
-    return tokens
-
-
-def tokenize_with_gpu(prompt: str, gpu_tokenizer_path: str = "./gpu_tokenizer_optimized",
-                      chunk_size: int = 2048) -> Tuple[List[str], Optional[float]]:
-    """
-    Tokenize text using GPU tokenizer by writing to input file and calling executable.
-    Returns:
-        (token_strings, kernel_time_ms) where kernel_time_ms is parsed from the
-        binary's stdout ("GPU BPE kernel time ...") if available, else None.
-    """
-    # Write prompt to input file (the GPU tokenizer reads from a fixed path)
-    # NOTE: This path must match the input_path hard-coded in the C++ binary.
-    input_path = Path("data/input/pride_and_prejudice.txt")
-    input_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Save original content if it exists
-    original_content = None
-    if input_path.exists():
-        original_content = input_path.read_text(encoding="utf-8", errors="ignore")
-    
-    # Write ONLY the prompt (ensure file is overwritten, not appended)
-    input_path.write_text(prompt, encoding="utf-8")
-    
-    # Verify file was written correctly
-    written_content = input_path.read_text(encoding="utf-8")
-    if written_content != prompt:
-        raise RuntimeError(f"Failed to write prompt to file. Expected '{prompt[:50]}...', got '{written_content[:50]}...'")
-    
-    try:
-        # Call GPU tokenizer
-        # The optimized version writes to gpu_tokens_optimized.txt, regular to gpu_tokens.txt
-        if "optimized" in gpu_tokenizer_path:
-            output_path = Path("data/output/gpu_tokens_optimized.txt")
-        else:
-            output_path = Path("data/output/gpu_tokens.txt")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Clear output file first
-        if output_path.exists():
-            output_path.unlink()
-        
-        result = subprocess.run(
-            [gpu_tokenizer_path, str(chunk_size)],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=Path.cwd()  # Ensure we're in the right directory
-        )
-        
-        if result.returncode != 0:
-            print(f"GPU tokenizer stderr: {result.stderr[:500]}")
-            print(f"GPU tokenizer stdout: {result.stdout[:500]}")
-            raise RuntimeError(f"GPU tokenizer failed with return code {result.returncode}")
-        
-        # Parse kernel time from stdout (in milliseconds), e.g.:
-        # "GPU BPE kernel time (optimized, excl. H2D/D2H): 2.78221 ms"
-        kernel_time_ms: Optional[float] = None
-        for line in result.stdout.splitlines():
-            m = re.search(r"GPU BPE kernel time.*:\s*([0-9.]+)\s*ms", line)
-            if m:
-                try:
-                    kernel_time_ms = float(m.group(1))
-                except ValueError:
-                    kernel_time_ms = None
-                break
-        
-        # Load token strings - only from first line (first chunk)
-        if not output_path.exists():
-            raise FileNotFoundError(f"GPU tokenizer did not create output file: {output_path}")
-        
-        tokens = load_gpu_token_strings(output_path)
-        
-        # If we got way too many tokens, it might be reading the whole file
-        # Take only the first chunk that corresponds to our prompt
-        expected_max = len(prompt) * 2  # Rough estimate: prompt length * 2
-        if len(tokens) > expected_max:
-            print(f"Warning: Got {len(tokens)} tokens for prompt of length {len(prompt)}")
-            print(f"Taking first {min(100, len(tokens))} tokens as sample")
-            # Estimate tokens for prompt (rough: ~1 token per 4 chars for English)
-            estimated_tokens = max(1, len(prompt) // 4)
-            tokens = tokens[:estimated_tokens * 2]  # Take 2x estimate to be safe
-        
-        return tokens, kernel_time_ms
-    
-    finally:
-        # Restore original content
-        if original_content is not None:
-            input_path.write_text(original_content, encoding="utf-8")
 
 
 def map_token_strings_to_ids(token_strings: List[str], hf_tokenizer) -> List[int]:
@@ -286,12 +180,6 @@ def compute_similarity(text1: str, text2: str) -> Tuple[float, float, float]:
 def main():
     parser = argparse.ArgumentParser(
         description="WikiText-103 benchmark for GPU BlockBPE, tiktoken, and HuggingFace tokenizers"
-    )
-    parser.add_argument(
-        "--gpu-tokenizer",
-        type=str,
-        default="./gpu_tokenizer_optimized",
-        help="Path to GPU tokenizer executable"
     )
     parser.add_argument(
         "--chunk-size",
@@ -470,8 +358,7 @@ def main():
             try:
                 if gpu_ext_tokenizer is not None:
                     gpu_ext_tokenizer.tokenize_batch([prompt])
-                else:
-                    tokenize_with_gpu(prompt, args.gpu_tokenizer, args.chunk_size)
+                    gpu_ext_tokenizer.tokenize_batch_blockbpe_base([prompt])
             except Exception:
                 pass
 
@@ -521,23 +408,27 @@ def main():
 
         # Tokenize
         gpu_token_ids = None
+        gpu_base_token_ids = None
         tiktoken_ids = None
         hf_token_ids = None
 
-        # GPU BlockBPE tokenization timing:
-        # - If extension is available: in-process tokenize_batch.
-        # - Else: fallback to subprocess-based tokenizer.
+        # GPU BlockBPE tokenization timing (optimized kernel via pybind11).
         try:
             if gpu_ext_tokenizer is not None:
                 batch_ids, kernel_ms = gpu_ext_tokenizer.tokenize_batch([prompt])
                 gpu_token_ids = batch_ids[0]
-            else:
-                gpu_token_strings, _ = tokenize_with_gpu(
-                    prompt, args.gpu_tokenizer, args.chunk_size
-                )
-                gpu_token_ids = map_token_strings_to_ids(gpu_token_strings, tokenizer)
         except Exception as e:
             print(f"  [GPU] ERROR: {e}")
+
+        # Baseline BlockBPE GPU (via pybind11 baseline kernel).
+        try:
+            if gpu_ext_tokenizer is not None:
+                base_batch_ids, base_kernel_ms = gpu_ext_tokenizer.tokenize_batch_blockbpe_base(
+                    [prompt]
+                )
+                gpu_base_token_ids = base_batch_ids[0]
+        except Exception as e:
+            print(f"  [GPU baseline] ERROR: {e}")
 
         # tiktoken tokenization timing
         try:
@@ -566,9 +457,23 @@ def main():
                     args.temperature,
                     args.top_p,
                 )
-                generations["GPU BlockBPE"] = gen_text
+                generations["GPU BlockBPE (opt)"] = gen_text
             except Exception as e:
                 print(f"  [GPU] Generation ERROR: {e}")
+
+        if gpu_base_token_ids:
+            try:
+                gen_text, gen_len = generate_text(
+                    model,
+                    tokenizer,
+                    gpu_base_token_ids,
+                    args.max_tokens,
+                    args.temperature,
+                    args.top_p,
+                )
+                generations["GPU BlockBPE (base)"] = gen_text
+            except Exception as e:
+                print(f"  [GPU baseline] Generation ERROR: {e}")
 
         if tiktoken_ids:
             try:

@@ -7,23 +7,30 @@ Benchmark how tokenizer speed scales with input length for:
 
 We use WikiText-103 as the source corpus, build long token streams with the
 HuggingFace tokenizer, then extract fixed-length windows of:
-  256, 512, 1024, 2048, 4096, 8192, 16384 HF tokens
+  256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072 HF tokens
 
 For each length we:
 - Build a small batch of prompts (decoded from HF token windows)
 - Warm up each tokenizer (not timed)
-- Measure:
-    * GPU BlockBPE batch end-to-end tokens/sec and chars/sec
-    * GPU BlockBPE batch kernel-only tokens/sec
-    * tiktoken batch tokens/sec and chars/sec
-    * HuggingFace batch tokens/sec and chars/sec
-- Compute speedup factors for GPU vs tiktoken and vs HuggingFace.
+- Run each tokenizer multiple times (configurable) and measure:
+    * GPU BlockBPE batch end-to-end pybind call time and kernel-only time
+    * CPU BlockBPE batch time (reference)
+    * tiktoken batch time
+    * HuggingFace batch time
+- Compute speedup factors for GPU vs tiktoken and vs HuggingFace based on tokens/sec
+  (even though the summary table reports times).
 """
 
 import math
 import time
+import subprocess
+import re
+import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+
+# Disable HuggingFace tokenizers fork/parallelism warnings.
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 try:
     import tiktoken
@@ -46,6 +53,11 @@ try:
     from torch.utils.cpp_extension import load as load_extension  # type: ignore
 except ImportError:
     load_extension = None
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 def build_gpu_extension(chunk_tokens: int = 2048, max_iters: int = 50):
@@ -87,6 +99,88 @@ def build_gpu_extension(chunk_tokens: int = 2048, max_iters: int = 50):
         return None, None
 
 
+def run_blockbpe_binary_on_prompts(
+    prompts: List[str],
+    exe_path: Path,
+    chunk_tokens: int,
+    timeout_s: int = 300,
+) -> Tuple[Optional[int], Optional[float], Optional[float]]:
+    """
+    Run the standalone BlockBPE GPU tokenizer binary (built from gputok_blockbpe.cu)
+    on a batch of prompts by concatenating them into a single input file.
+
+    Returns:
+        (total_tokens, call_time_s, kernel_time_s) where any element may be None on failure.
+    """
+    exe_path = exe_path.resolve()
+    if not exe_path.exists():
+        print(f"BlockBPE binary not found at {exe_path}; skipping baseline BlockBPE benchmark.")
+        return None, None, None
+
+    if not prompts:
+        return None, None, None
+
+    input_path = Path("data/input/blockbpe_scaling_input.txt")
+    output_path = Path("data/output/gpu_tokens_blockbpe.txt")
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Concatenate prompts with newlines; the binary treats the whole file as one sequence.
+    text = "\n".join(prompts)
+    input_path.write_text(text, encoding="utf-8")
+
+    if output_path.exists():
+        output_path.unlink()
+
+    cmd = [str(exe_path), str(chunk_tokens), str(input_path.resolve())]
+    t0 = time.perf_counter()
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+        cwd=str(exe_path.parent),
+    )
+    t1 = time.perf_counter()
+    call_time_s = t1 - t0
+
+    if result.returncode != 0:
+        print(f"[BlockBPE baseline] stderr: {result.stderr[:500]}")
+        print(f"[BlockBPE baseline] stdout: {result.stdout[:500]}")
+        print(f"[BlockBPE baseline] binary failed with return code {result.returncode}")
+        return None, None, None
+
+    kernel_ms: Optional[float] = None
+    for line in result.stdout.splitlines():
+        m = re.search(
+            r"GPU BlockBPE-style greedy kernel time.*:\s*([0-9.]+)\s*ms", line
+        )
+        if m:
+            try:
+                kernel_ms = float(m.group(1))
+            except ValueError:
+                kernel_ms = None
+            break
+
+    if not output_path.exists():
+        print("[BlockBPE baseline] Output token file not found; skipping.")
+        return None, None, None
+
+    total_tokens = 0
+    with output_path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                total_tokens += len(line.split())
+
+    if total_tokens == 0:
+        print("[BlockBPE baseline] No tokens produced; skipping.")
+        return None, None, None
+
+    kernel_s = (kernel_ms / 1000.0) if kernel_ms is not None else None
+    return total_tokens, call_time_s, kernel_s
+
+
 def build_hf_and_tiktoken():
     """Build the HuggingFace and tiktoken GPT-2 tokenizers."""
     if AutoTokenizer is None:
@@ -119,13 +213,13 @@ def load_wikitext_stream(hf_tok) -> List[int]:
     full_text = "\n".join(texts)
     print(f"Full text length (chars): {len(full_text)}")
 
-    # For this benchmark we only need a manageable slice of the corpus to keep
-    # GPU shared-memory usage under control. Take the first ~200k characters.
-    max_chars = 200_000
-    sliced_text = full_text[:max_chars]
-    print(f"Encoding first {len(sliced_text)} chars with HuggingFace GPT-2 tokenizer...")
-    hf_ids = hf_tok.encode(sliced_text, add_special_tokens=False)
-    print(f"Total HF tokens in stream (sliced): {len(hf_ids)}\n")
+    # Encode the full test split to ensure we have enough tokens for the
+    # largest target length in the scaling benchmark. The GPU tokenizer
+    # internally chunks long inputs, so we are not constrained by shared
+    # memory limits here.
+    print("Encoding full WikiText-103 test split with HuggingFace GPT-2 tokenizer...")
+    hf_ids = hf_tok.encode(full_text, add_special_tokens=False)
+    print(f"Total HF tokens in stream: {len(hf_ids)}\n")
     return hf_ids
 
 
@@ -166,6 +260,7 @@ def benchmark_tokenizers_for_length(
     hf_tok,
     tk_enc,
     gpu_ext_tokenizer,
+    num_runs: int = 1,
 ) -> Tuple[dict, dict]:
     """
     Benchmark all tokenizers for a given HF token length.
@@ -174,10 +269,8 @@ def benchmark_tokenizers_for_length(
       (metrics, speedups)
       where metrics and speedups are dicts keyed by tokenizer name.
     """
-    metrics = {}
-    speedups = {}
-
-    total_chars = sum(len(p) for p in prompts)
+    metrics: dict = {}
+    speedups: dict = {}
 
     # Warmup (not timed) for CPU tokenizers
     if tk_enc is not None:
@@ -196,92 +289,151 @@ def benchmark_tokenizers_for_length(
     except Exception:
         pass
 
-    # GPU BlockBPE (batch)
+    # GPU BlockBPE (batch, optimized pybind implementation)
     if gpu_ext_tokenizer is not None:
         try:
-            t0 = time.perf_counter()
-            batch_ids, kernel_ms = gpu_ext_tokenizer.tokenize_batch(prompts)
-            t1 = time.perf_counter()
-            gpu_time = t1 - t0
-            gpu_tokens = sum(len(ids) for ids in batch_ids)
-            gpu_chars = total_chars
-            gpu_kernel_s = (kernel_ms or 0.0) / 1000.0
+            total_time = 0.0
+            total_kernel_s = 0.0
+            gpu_tokens = 0
+            runs_ok = 0
+            for _ in range(num_runs):
+                t0 = time.perf_counter()
+                batch_ids, kernel_ms = gpu_ext_tokenizer.tokenize_batch(prompts)
+                t1 = time.perf_counter()
+                run_time = t1 - t0
+                if batch_ids:
+                    gpu_tokens = sum(len(ids) for ids in batch_ids)
+                total_time += run_time
+                if kernel_ms is not None:
+                    total_kernel_s += (kernel_ms / 1000.0)
+                runs_ok += 1
 
-            metrics["gpu_blockbpe"] = {
-                "tokens": gpu_tokens,
-                "chars": gpu_chars,
-                "time_s": gpu_time,
-                "kernel_s": gpu_kernel_s,
-                "tokens_per_s": gpu_tokens / gpu_time if gpu_time > 0 else float("inf"),
-                "chars_per_s": gpu_chars / gpu_time if gpu_time > 0 else float("inf"),
-                "kernel_tokens_per_s": (
-                    gpu_tokens / gpu_kernel_s if gpu_kernel_s > 0 else float("inf")
-                ),
-            }
+            if runs_ok > 0 and gpu_tokens > 0 and total_time > 0.0:
+                avg_time = total_time / runs_ok
+                avg_kernel_s = total_kernel_s / runs_ok if total_kernel_s > 0 else 0.0
+                metrics["gpu_blockbpe"] = {
+                    "tokens": gpu_tokens,
+                    "time_s": avg_time,
+                    "kernel_s": avg_kernel_s,
+                    "tokens_per_s": gpu_tokens / avg_time if avg_time > 0 else float("inf"),
+                    "kernel_tokens_per_s": (
+                        gpu_tokens / avg_kernel_s if avg_kernel_s > 0 else float("inf")
+                    ),
+                }
         except Exception as e:
             print(f"[len={length}] GPU BlockBPE ERROR: {e}")
+
+    # GPU BlockBPE baseline (batch, pybind implementation of gputok_blockbpe.cu)
+    if gpu_ext_tokenizer is not None:
+        try:
+            total_time = 0.0
+            total_kernel_s = 0.0
+            gpu_tokens = 0
+            runs_ok = 0
+            for _ in range(num_runs):
+                t0 = time.perf_counter()
+                batch_ids, kernel_ms = gpu_ext_tokenizer.tokenize_batch_blockbpe_base(prompts)
+                t1 = time.perf_counter()
+                run_time = t1 - t0
+                if batch_ids:
+                    gpu_tokens = sum(len(ids) for ids in batch_ids)
+                total_time += run_time
+                if kernel_ms is not None:
+                    total_kernel_s += (kernel_ms / 1000.0)
+                runs_ok += 1
+
+            if runs_ok > 0 and gpu_tokens > 0 and total_time > 0.0:
+                avg_time = total_time / runs_ok
+                avg_kernel_s = total_kernel_s / runs_ok if total_kernel_s > 0 else 0.0
+                metrics["gpu_blockbpe_baseline"] = {
+                    "tokens": gpu_tokens,
+                    "time_s": avg_time,
+                    "kernel_s": avg_kernel_s,
+                    "tokens_per_s": gpu_tokens / avg_time if avg_time > 0 else float("inf"),
+                    "kernel_tokens_per_s": (
+                        gpu_tokens / avg_kernel_s if avg_kernel_s > 0 else float("inf")
+                    ),
+                }
+        except Exception as e:
+            print(f"[len={length}] GPU BlockBPE baseline ERROR: {e}")
 
     # CPU BlockBPE (batch, reference)
     if gpu_ext_tokenizer is not None:
         try:
-            t0 = time.perf_counter()
-            cpu_batch_ids = gpu_ext_tokenizer.tokenize_batch_cpu(prompts)
-            t1 = time.perf_counter()
-            cpu_time = t1 - t0
-            cpu_tokens = sum(len(ids) for ids in cpu_batch_ids)
-            cpu_chars = total_chars
+            total_time = 0.0
+            cpu_tokens = 0
+            runs_ok = 0
+            for _ in range(num_runs):
+                t0 = time.perf_counter()
+                cpu_batch_ids = gpu_ext_tokenizer.tokenize_batch_cpu(prompts)
+                t1 = time.perf_counter()
+                run_time = t1 - t0
+                if cpu_batch_ids:
+                    cpu_tokens = sum(len(ids) for ids in cpu_batch_ids)
+                total_time += run_time
+                runs_ok += 1
 
-            metrics["cpu_blockbpe"] = {
-                "tokens": cpu_tokens,
-                "chars": cpu_chars,
-                "time_s": cpu_time,
-                "tokens_per_s": cpu_tokens / cpu_time if cpu_time > 0 else float("inf"),
-                "chars_per_s": cpu_chars / cpu_time if cpu_time > 0 else float("inf"),
-            }
+            if runs_ok > 0 and cpu_tokens > 0 and total_time > 0.0:
+                avg_time = total_time / runs_ok
+                metrics["cpu_blockbpe"] = {
+                    "tokens": cpu_tokens,
+                    "time_s": avg_time,
+                    "tokens_per_s": cpu_tokens / avg_time if avg_time > 0 else float("inf"),
+                }
         except Exception as e:
             print(f"[len={length}] CPU BlockBPE ERROR: {e}")
 
     # tiktoken
     if tk_enc is not None:
         try:
-            t0 = time.perf_counter()
-            tk_ids_list = [tk_enc.encode(p) for p in prompts]
-            t1 = time.perf_counter()
-            tk_time = t1 - t0
-            tk_tokens = sum(len(ids) for ids in tk_ids_list)
-            tk_chars = total_chars
+            total_time = 0.0
+            tk_tokens = 0
+            runs_ok = 0
+            for _ in range(num_runs):
+                t0 = time.perf_counter()
+                tk_ids_list = [tk_enc.encode(p) for p in prompts]
+                t1 = time.perf_counter()
+                run_time = t1 - t0
+                tk_tokens = sum(len(ids) for ids in tk_ids_list)
+                total_time += run_time
+                runs_ok += 1
 
-            metrics["tiktoken"] = {
-                "tokens": tk_tokens,
-                "chars": tk_chars,
-                "time_s": tk_time,
-                "tokens_per_s": tk_tokens / tk_time if tk_time > 0 else float("inf"),
-                "chars_per_s": tk_chars / tk_time if tk_time > 0 else float("inf"),
-            }
+            if runs_ok > 0 and tk_tokens > 0 and total_time > 0.0:
+                avg_time = total_time / runs_ok
+                metrics["tiktoken"] = {
+                    "tokens": tk_tokens,
+                    "time_s": avg_time,
+                    "tokens_per_s": tk_tokens / avg_time if avg_time > 0 else float("inf"),
+                }
         except Exception as e:
             print(f"[len={length}] tiktoken ERROR: {e}")
 
     # HuggingFace GPT-2
     try:
-        t0 = time.perf_counter()
-        hf_out = hf_tok.batch_encode_plus(
-            prompts,
-            add_special_tokens=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
-        )
-        t1 = time.perf_counter()
-        hf_time = t1 - t0
-        hf_tokens = sum(len(ids) for ids in hf_out["input_ids"])
-        hf_chars = total_chars
+        total_time = 0.0
+        hf_tokens = 0
+        runs_ok = 0
+        for _ in range(num_runs):
+            t0 = time.perf_counter()
+            hf_out = hf_tok.batch_encode_plus(
+                prompts,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            t1 = time.perf_counter()
+            run_time = t1 - t0
+            hf_tokens = sum(len(ids) for ids in hf_out["input_ids"])
+            total_time += run_time
+            runs_ok += 1
 
-        metrics["huggingface"] = {
-            "tokens": hf_tokens,
-            "chars": hf_chars,
-            "time_s": hf_time,
-            "tokens_per_s": hf_tokens / hf_time if hf_time > 0 else float("inf"),
-            "chars_per_s": hf_chars / hf_time if hf_time > 0 else float("inf"),
-        }
+        if runs_ok > 0 and hf_tokens > 0 and total_time > 0.0:
+            avg_time = total_time / runs_ok
+            metrics["huggingface"] = {
+                "tokens": hf_tokens,
+                "time_s": avg_time,
+                "tokens_per_s": hf_tokens / avg_time if avg_time > 0 else float("inf"),
+            }
     except Exception as e:
         print(f"[len={length}] HuggingFace ERROR: {e}")
 
@@ -308,6 +460,7 @@ def benchmark_tokenizers_latency_for_length(
     hf_tok,
     tk_enc,
     gpu_ext_tokenizer,
+    num_runs: int = 1,
 ) -> Tuple[dict, dict]:
     """
     Benchmark all tokenizers for a given HF token length in per-prompt
@@ -316,104 +469,221 @@ def benchmark_tokenizers_latency_for_length(
     Returns:
       (metrics, speedups) in the same format as the batched benchmark.
     """
-    metrics = {}
-    speedups = {}
-
-    total_chars = sum(len(p) for p in prompts)
+    metrics: dict = {}
+    speedups: dict = {}
 
     # GPU BlockBPE latency: one prompt per call
     if gpu_ext_tokenizer is not None:
         try:
-            total_tokens = 0
             total_time = 0.0
             total_kernel_s = 0.0
-            for p in prompts:
-                t0 = time.perf_counter()
-                batch_ids, kernel_ms = gpu_ext_tokenizer.tokenize_batch([p])
-                t1 = time.perf_counter()
-                total_time += t1 - t0
-                if batch_ids:
-                    total_tokens += len(batch_ids[0])
-                if kernel_ms is not None:
-                    total_kernel_s += (kernel_ms / 1000.0)
+            total_tokens = 0
+            runs_ok = 0
+            for _ in range(num_runs):
+                run_tokens = 0
+                run_time = 0.0
+                run_kernel_s = 0.0
+                for p in prompts:
+                    t0 = time.perf_counter()
+                    batch_ids, kernel_ms = gpu_ext_tokenizer.tokenize_batch([p])
+                    t1 = time.perf_counter()
+                    run_time += t1 - t0
+                    if batch_ids:
+                        run_tokens += len(batch_ids[0])
+                    if kernel_ms is not None:
+                        run_kernel_s += (kernel_ms / 1000.0)
+                if run_tokens > 0 and run_time > 0.0:
+                    total_time += run_time
+                    total_kernel_s += run_kernel_s
+                    total_tokens = run_tokens
+                    runs_ok += 1
 
-            metrics["gpu_blockbpe"] = {
-                "tokens": total_tokens,
-                "chars": total_chars,
-                "time_s": total_time,
-                "kernel_s": total_kernel_s,
-                "tokens_per_s": total_tokens / total_time if total_time > 0 else float("inf"),
-                "chars_per_s": total_chars / total_time if total_time > 0 else float("inf"),
-                "kernel_tokens_per_s": (
-                    total_tokens / total_kernel_s if total_kernel_s > 0 else float("inf")
-                ),
-            }
+            if runs_ok > 0 and total_tokens > 0 and total_time > 0.0:
+                avg_time = total_time / runs_ok
+                avg_kernel_s = total_kernel_s / runs_ok if total_kernel_s > 0 else 0.0
+                metrics["gpu_blockbpe"] = {
+                    "tokens": total_tokens,
+                    "time_s": avg_time,
+                    "kernel_s": avg_kernel_s,
+                    "tokens_per_s": total_tokens / avg_time if avg_time > 0 else float("inf"),
+                    "kernel_tokens_per_s": (
+                        total_tokens / avg_kernel_s if avg_kernel_s > 0 else float("inf")
+                    ),
+                }
         except Exception as e:
             print(f"[len={length}] GPU BlockBPE (latency) ERROR: {e}")
 
     # CPU BlockBPE latency: one prompt per call
     if gpu_ext_tokenizer is not None:
         try:
-            total_tokens = 0
             total_time = 0.0
-            for p in prompts:
-                t0 = time.perf_counter()
-                cpu_batch_ids = gpu_ext_tokenizer.tokenize_batch_cpu([p])
-                t1 = time.perf_counter()
-                total_time += t1 - t0
-                if cpu_batch_ids:
-                    total_tokens += len(cpu_batch_ids[0])
+            total_tokens = 0
+            runs_ok = 0
+            for _ in range(num_runs):
+                run_tokens = 0
+                run_time = 0.0
+                for p in prompts:
+                    t0 = time.perf_counter()
+                    cpu_batch_ids = gpu_ext_tokenizer.tokenize_batch_cpu([p])
+                    t1 = time.perf_counter()
+                    run_time += t1 - t0
+                    if cpu_batch_ids:
+                        run_tokens += len(cpu_batch_ids[0])
+                if run_tokens > 0 and run_time > 0.0:
+                    total_time += run_time
+                    total_tokens = run_tokens
+                    runs_ok += 1
 
-            metrics["cpu_blockbpe"] = {
-                "tokens": total_tokens,
-                "chars": total_chars,
-                "time_s": total_time,
-                "tokens_per_s": total_tokens / total_time if total_time > 0 else float("inf"),
-                "chars_per_s": total_chars / total_time if total_time > 0 else float("inf"),
-            }
+            if runs_ok > 0 and total_tokens > 0 and total_time > 0.0:
+                avg_time = total_time / runs_ok
+                metrics["cpu_blockbpe"] = {
+                    "tokens": total_tokens,
+                    "time_s": avg_time,
+                    "tokens_per_s": total_tokens / avg_time if avg_time > 0 else float("inf"),
+                }
         except Exception as e:
             print(f"[len={length}] CPU BlockBPE (latency) ERROR: {e}")
+
+    # Baseline BlockBPE latency: one prompt per call.
+    # Prefer pybind11 baseline kernel; fall back to standalone binary if needed.
+    if gpu_ext_tokenizer is not None:
+        try:
+            total_time = 0.0
+            total_kernel_s = 0.0
+            total_tokens = 0
+            runs_ok = 0
+            for _ in range(num_runs):
+                run_tokens = 0
+                run_time = 0.0
+                run_kernel_s = 0.0
+                for p in prompts:
+                    t0 = time.perf_counter()
+                    batch_ids, kernel_ms = gpu_ext_tokenizer.tokenize_batch_blockbpe_base([p])
+                    t1 = time.perf_counter()
+                    run_time += t1 - t0
+                    if batch_ids:
+                        run_tokens += len(batch_ids[0])
+                    if kernel_ms is not None:
+                        run_kernel_s += (kernel_ms / 1000.0)
+                if run_tokens > 0 and run_time > 0.0:
+                    total_time += run_time
+                    total_kernel_s += run_kernel_s
+                    total_tokens = run_tokens
+                    runs_ok += 1
+
+            if runs_ok > 0 and total_tokens > 0 and total_time > 0.0:
+                avg_time = total_time / runs_ok
+                avg_kernel_s = total_kernel_s / runs_ok if total_kernel_s > 0 else 0.0
+                metrics["gpu_blockbpe_baseline"] = {
+                    "tokens": total_tokens,
+                    "time_s": avg_time,
+                    "kernel_s": avg_kernel_s,
+                    "tokens_per_s": total_tokens / avg_time if avg_time > 0 else float("inf"),
+                    "kernel_tokens_per_s": (
+                        total_tokens / avg_kernel_s if avg_kernel_s > 0 else float("inf")
+                    ),
+                }
+        except Exception as e:
+            print(f"[len={length}] GPU BlockBPE baseline (latency, pybind) ERROR: {e}")
+    else:
+        blockbpe_exe = (Path(__file__).parent / "gpu_tokenizer_blockbpe").resolve()
+        if blockbpe_exe.exists():
+            try:
+                total_time = 0.0
+                total_kernel_s = 0.0
+                total_tokens = 0
+                runs_ok = 0
+                for _ in range(num_runs):
+                    run_tokens = 0
+                    run_time = 0.0
+                    run_kernel_s = 0.0
+                    for p in prompts:
+                        tokens, call_time_s, kernel_s = run_blockbpe_binary_on_prompts(
+                            [p], blockbpe_exe, chunk_tokens=2048
+                        )
+                        if tokens is None or call_time_s is None:
+                            continue
+                        run_tokens += tokens
+                        run_time += call_time_s
+                        if kernel_s is not None:
+                            run_kernel_s += kernel_s
+                    if run_tokens > 0 and run_time > 0.0:
+                        total_time += run_time
+                        total_kernel_s += run_kernel_s
+                        total_tokens = run_tokens
+                        runs_ok += 1
+
+                if runs_ok > 0 and total_tokens > 0 and total_time > 0.0:
+                    avg_time = total_time / runs_ok
+                    avg_kernel_s = total_kernel_s / runs_ok if total_kernel_s > 0 else 0.0
+                    metrics["gpu_blockbpe_baseline"] = {
+                        "tokens": total_tokens,
+                        "time_s": avg_time,
+                        "kernel_s": avg_kernel_s,
+                        "tokens_per_s": total_tokens / avg_time if avg_time > 0 else float("inf"),
+                        "kernel_tokens_per_s": (
+                            total_tokens / avg_kernel_s if avg_kernel_s > 0 else float("inf")
+                        ),
+                    }
+            except Exception as e:
+                print(f"[len={length}] GPU BlockBPE baseline (latency, binary) ERROR: {e}")
 
     # tiktoken latency: one prompt per encode() call
     if tk_enc is not None:
         try:
-            total_tokens = 0
             total_time = 0.0
-            for p in prompts:
-                t0 = time.perf_counter()
-                ids = tk_enc.encode(p)
-                t1 = time.perf_counter()
-                total_time += t1 - t0
-                total_tokens += len(ids)
+            total_tokens = 0
+            runs_ok = 0
+            for _ in range(num_runs):
+                run_tokens = 0
+                run_time = 0.0
+                for p in prompts:
+                    t0 = time.perf_counter()
+                    ids = tk_enc.encode(p)
+                    t1 = time.perf_counter()
+                    run_time += t1 - t0
+                    run_tokens += len(ids)
+                if run_tokens > 0 and run_time > 0.0:
+                    total_time += run_time
+                    total_tokens = run_tokens
+                    runs_ok += 1
 
-            metrics["tiktoken"] = {
-                "tokens": total_tokens,
-                "chars": total_chars,
-                "time_s": total_time,
-                "tokens_per_s": total_tokens / total_time if total_time > 0 else float("inf"),
-                "chars_per_s": total_chars / total_time if total_time > 0 else float("inf"),
-            }
+            if runs_ok > 0 and total_tokens > 0 and total_time > 0.0:
+                avg_time = total_time / runs_ok
+                metrics["tiktoken"] = {
+                    "tokens": total_tokens,
+                    "time_s": avg_time,
+                    "tokens_per_s": total_tokens / avg_time if avg_time > 0 else float("inf"),
+                }
         except Exception as e:
             print(f"[len={length}] tiktoken (latency) ERROR: {e}")
 
     # HuggingFace latency: one prompt per encode() call
     try:
-        total_tokens = 0
         total_time = 0.0
-        for p in prompts:
-            t0 = time.perf_counter()
-            ids = hf_tok.encode(p, add_special_tokens=False)
-            t1 = time.perf_counter()
-            total_time += t1 - t0
-            total_tokens += len(ids)
+        total_tokens = 0
+        runs_ok = 0
+        for _ in range(num_runs):
+            run_tokens = 0
+            run_time = 0.0
+            for p in prompts:
+                t0 = time.perf_counter()
+                ids = hf_tok.encode(p, add_special_tokens=False)
+                t1 = time.perf_counter()
+                run_time += t1 - t0
+                run_tokens += len(ids)
+            if run_tokens > 0 and run_time > 0.0:
+                total_time += run_time
+                total_tokens = run_tokens
+                runs_ok += 1
 
-        metrics["huggingface"] = {
-            "tokens": total_tokens,
-            "chars": total_chars,
-            "time_s": total_time,
-            "tokens_per_s": total_tokens / total_time if total_time > 0 else float("inf"),
-            "chars_per_s": total_chars / total_time if total_time > 0 else float("inf"),
-        }
+        if runs_ok > 0 and total_tokens > 0 and total_time > 0.0:
+            avg_time = total_time / runs_ok
+            metrics["huggingface"] = {
+                "tokens": total_tokens,
+                "time_s": avg_time,
+                "tokens_per_s": total_tokens / avg_time if avg_time > 0 else float("inf"),
+            }
     except Exception as e:
         print(f"[len={length}] HuggingFace (latency) ERROR: {e}")
 
@@ -430,6 +700,24 @@ def benchmark_tokenizers_latency_for_length(
         if "huggingface" in metrics:
             tps = metrics["huggingface"]["tokens_per_s"]
             speedups["gpu_vs_hf"] = g_tps / tps if tps > 0 else float("inf")
+
+        # Additional speedups for opt GPU BlockBPE vs CPU tokenizers
+        if "tiktoken" in metrics:
+            tps = metrics["tiktoken"]["tokens_per_s"]
+            speedups["gpu_opt_vs_tiktoken"] = g_tps / tps if tps > 0 else float("inf")
+        if "huggingface" in metrics:
+            tps = metrics["huggingface"]["tokens_per_s"]
+            speedups["gpu_opt_vs_hf"] = g_tps / tps if tps > 0 else float("inf")
+
+    if "gpu_blockbpe_baseline" in metrics:
+        b = metrics["gpu_blockbpe_baseline"]
+        b_tps = b["tokens_per_s"]
+        if "tiktoken" in metrics:
+            tps = metrics["tiktoken"]["tokens_per_s"]
+            speedups["gpu_base_vs_tiktoken"] = b_tps / tps if tps > 0 else float("inf")
+        if "huggingface" in metrics:
+            tps = metrics["huggingface"]["tokens_per_s"]
+            speedups["gpu_base_vs_hf"] = b_tps / tps if tps > 0 else float("inf")
 
     return metrics, speedups
 
@@ -456,8 +744,9 @@ def main():
     # With chunking in GpuTokenizer (at most chunk_tokens_ per chunk), the GPU
     # kernel can safely handle arbitrarily long texts by splitting them into
     # multiple chunks. We therefore enable GPU benchmarking for all lengths.
-    target_lengths = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 131072]
+    target_lengths = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
     num_prompts_per_length = 16  # per length
+    num_runs_per_length = 10  # average over this many runs per tokenizer/length
 
     print("=" * 80)
     print("Tokenizer scaling benchmark (WikiText-103, GPT-2 vocabulary)")
@@ -467,7 +756,11 @@ def main():
 
     results = {}
 
-    for length in target_lengths:
+    length_iter = target_lengths
+    if tqdm is not None:
+        length_iter = tqdm(target_lengths, desc="Seq length buckets", unit="bucket")
+
+    for length in length_iter:
         print("-" * 80)
         print(f"Length bucket: {length} HF tokens")
         try:
@@ -478,97 +771,52 @@ def main():
             print(f"  Skipping length {length}: {e}")
             continue
 
-        # Run GPU BlockBPE for all lengths when the extension is available; the
-        # underlying implementation chunks long inputs internally.
-        metrics_batch, speedups_batch = benchmark_tokenizers_for_length(
-            length, prompts, hf_tok, tk_enc, gpu_ext_tokenizer
-        )
+        # Single-sequence (latency) benchmarks only: one prompt at a time.
         metrics_lat, speedups_lat = benchmark_tokenizers_latency_for_length(
-            length, prompts, hf_tok, tk_enc, gpu_ext_tokenizer
+            length, prompts, hf_tok, tk_enc, gpu_ext_tokenizer, num_runs=num_runs_per_length
         )
-        results[length] = (metrics_batch, speedups_batch, metrics_lat, speedups_lat)
+        results[length] = (None, None, metrics_lat, speedups_lat)
 
         total_chars = sum(len(p) for p in prompts)
         print(f"  Built {len(prompts)} prompts, total chars={total_chars}")
 
-        # Pretty-print batched metrics
-        if "gpu_blockbpe" in metrics_batch:
-            m = metrics_batch["gpu_blockbpe"]
-            print(
-                f"  GPU BlockBPE (batch): "
-                f"{m['tokens_per_s']:.1f} tokens/s, {m['chars_per_s']:.1f} chars/s "
-                f"(tokens={m['tokens']}, chars={m['chars']}, time={m['time_s']:.4f}s)"
-            )
-            if m["kernel_s"] > 0:
-                print(
-                    f"    kernel-only: {m['kernel_tokens_per_s']:.1f} tokens/s "
-                    f"(kernel_time={m['kernel_s']:.6f}s)"
-                )
-
-        if "tiktoken" in metrics_batch:
-            m = metrics_batch["tiktoken"]
-            print(
-                f"  tiktoken:           "
-                f"{m['tokens_per_s']:.1f} tokens/s, {m['chars_per_s']:.1f} chars/s "
-                f"(tokens={m['tokens']}, chars={m['chars']}, time={m['time_s']:.4f}s)"
-            )
-
-        if "huggingface" in metrics_batch:
-            m = metrics_batch["huggingface"]
-            print(
-                f"  HuggingFace GPT-2:  "
-                f"{m['tokens_per_s']:.1f} tokens/s, {m['chars_per_s']:.1f} chars/s "
-                f"(tokens={m['tokens']}, chars={m['chars']}, time={m['time_s']:.4f}s)"
-            )
-
-        # CPU BlockBPE (batch)
-        if "cpu_blockbpe" in metrics_batch:
-            m = metrics_batch["cpu_blockbpe"]
-            print(
-                f"  CPU BlockBPE (batch):"
-                f"{m['tokens_per_s']:.1f} tokens/s, {m['chars_per_s']:.1f} chars/s "
-                f"(tokens={m['tokens']}, chars={m['chars']}, time={m['time_s']:.4f}s)"
-            )
-
-        # Pretty-print latency metrics
+        # Pretty-print latency metrics (single-sequence)
         if "cpu_blockbpe" in metrics_lat:
             m = metrics_lat["cpu_blockbpe"]
             print(
                 f"  CPU BlockBPE (lat):  "
-                f"{m['tokens_per_s']:.1f} tokens/s, {m['chars_per_s']:.1f} chars/s "
-                f"(tokens={m['tokens']}, chars={m['chars']}, time={m['time_s']:.4f}s)"
+                f"{m['tokens_per_s']:.1f} tokens/s "
+                f"(tokens={m['tokens']}, time={m['time_s']:.4f}s)"
             )
 
         if "gpu_blockbpe" in metrics_lat:
             m = metrics_lat["gpu_blockbpe"]
             print(
                 f"  GPU BlockBPE (lat):   "
-                f"{m['tokens_per_s']:.1f} tokens/s, {m['chars_per_s']:.1f} chars/s "
-                f"(tokens={m['tokens']}, chars={m['chars']}, time={m['time_s']:.4f}s)"
+                f"{m['tokens_per_s']:.1f} tokens/s "
+                f"(tokens={m['tokens']}, time={m['time_s']:.4f}s)"
+            )
+        if "gpu_blockbpe_baseline" in metrics_lat:
+            m = metrics_lat["gpu_blockbpe_baseline"]
+            print(
+                f"  GPU BlockBPE base (lat):"
+                f"{m['tokens_per_s']:.1f} tokens/s "
+                f"(tokens={m['tokens']}, time={m['time_s']:.4f}s)"
             )
         if "tiktoken" in metrics_lat:
             m = metrics_lat["tiktoken"]
             print(
                 f"  tiktoken (lat):      "
-                f"{m['tokens_per_s']:.1f} tokens/s, {m['chars_per_s']:.1f} chars/s "
-                f"(tokens={m['tokens']}, chars={m['chars']}, time={m['time_s']:.4f}s)"
+                f"{m['tokens_per_s']:.1f} tokens/s "
+                f"(tokens={m['tokens']}, time={m['time_s']:.4f}s)"
             )
         if "huggingface" in metrics_lat:
             m = metrics_lat["huggingface"]
             print(
                 f"  HF GPT-2 (lat):      "
-                f"{m['tokens_per_s']:.1f} tokens/s, {m['chars_per_s']:.1f} chars/s "
-                f"(tokens={m['tokens']}, chars={m['chars']}, time={m['time_s']:.4f}s)"
+                f"{m['tokens_per_s']:.1f} tokens/s "
+                f"(tokens={m['tokens']}, time={m['time_s']:.4f}s)"
             )
-
-        # Speedups (batched)
-        if speedups_batch:
-            if "gpu_vs_cpu_blockbpe" in speedups_batch:
-                print(f"  Speedup GPU vs CPU BlockBPE (batch): {speedups_batch['gpu_vs_cpu_blockbpe']:.2f}x")
-            if "gpu_vs_tiktoken" in speedups_batch:
-                print(f"  Speedup GPU vs tiktoken (batch):  {speedups_batch['gpu_vs_tiktoken']:.2f}x")
-            if "gpu_vs_hf" in speedups_batch:
-                print(f"  Speedup GPU vs HF (batch):        {speedups_batch['gpu_vs_hf']:.2f}x")
 
         # Speedups (latency)
         if speedups_lat:
@@ -580,32 +828,24 @@ def main():
                 print(f"  Speedup GPU vs HF (lat):          {speedups_lat['gpu_vs_hf']:.2f}x")
 
     # ------------------------------------------------------------------
-    # Summary tables (tokens/sec) for easy comparison across lengths
+    # Summary tables (latency-only, single-sequence) for easy comparison
     # ------------------------------------------------------------------
     if results:
-        # Batched throughput
         print("\n" + "=" * 80)
-        print("Summary (BATCH): tokenizer throughput vs input length (tokens/sec)")
+        print("Summary (LATENCY, single sequence): average time vs input length")
         print("=" * 80)
 
-        header = (
-            f"{'Len (HF tok)':>12}  "
-            f"{'GPU tok/s':>12}  "
-            f"{'CPU BPE':>12}  "
-            f"{'tiktoken':>12}  "
-            f"{'HF tok/s':>12}  "
-            f"{'GPU/CPU':>8}  "
-            f"{'GPU/TK':>8}  "
-            f"{'GPU/HF':>8}"
-        )
-        print(header)
-        print("-" * len(header))
-
-        def fmt_tps(metrics: dict, key: str) -> str:
+        def fmt_time_ms(metrics: dict, key: str) -> str:
             if key not in metrics:
                 return "     -     "
-            v = metrics[key]["tokens_per_s"]
-            return f"{v/1e6:6.2f}M"
+            v = metrics[key]["time_s"]
+            return f"{v*1000:7.2f}ms"
+
+        def fmt_kernel_ms(metrics: dict, key: str) -> str:
+            if key not in metrics or "kernel_s" not in metrics[key]:
+                return "     -     "
+            v = metrics[key]["kernel_s"]
+            return f"{v*1000:7.2f}ms"
 
         def fmt_speed(speedups: dict, key: str) -> str:
             if key not in speedups:
@@ -613,52 +853,67 @@ def main():
             v = speedups[key]
             return f"{v:6.2f}x"
 
+        # Table 1: absolute times
+        header_time = (
+            f"{'Len (HF tok)':>12}  "
+            f"{'GPU opt':>12}  "
+            f"{'GPU opt k':>12}  "
+            f"{'GPU base':>12}  "
+            f"{'GPU base k':>12}  "
+            f"{'CPU BPE':>12}  "
+            f"{'tiktoken':>12}  "
+            f"{'HF time':>12}"
+        )
+        print(header_time)
+        print("-" * len(header_time))
+
         for length in sorted(results.keys()):
-            metrics_batch, speedups_batch, _, _ = results[length]
-            gpu = fmt_tps(metrics_batch, "gpu_blockbpe")
-            cpu = fmt_tps(metrics_batch, "cpu_blockbpe")
-            tk = fmt_tps(metrics_batch, "tiktoken")
-            hf = fmt_tps(metrics_batch, "huggingface")
-            gpu_cpu = fmt_speed(speedups_batch, "gpu_vs_cpu_blockbpe")
-            gpu_tk = fmt_speed(speedups_batch, "gpu_vs_tiktoken")
-            gpu_hf = fmt_speed(speedups_batch, "gpu_vs_hf")
+            _, _, metrics_lat, _ = results[length]
+            gpu_opt = fmt_time_ms(metrics_lat, "gpu_blockbpe")
+            gpu_opt_k = fmt_kernel_ms(metrics_lat, "gpu_blockbpe")
+            gpu_base = fmt_time_ms(metrics_lat, "gpu_blockbpe_baseline")
+            gpu_base_k = fmt_kernel_ms(metrics_lat, "gpu_blockbpe_baseline")
+            cpu = fmt_time_ms(metrics_lat, "cpu_blockbpe")
+            tk = fmt_time_ms(metrics_lat, "tiktoken")
+            hf = fmt_time_ms(metrics_lat, "huggingface")
             print(
                 f"{length:12d}  "
-                f"{gpu:>12}  "
+                f"{gpu_opt:>12}  "
+                f"{gpu_opt_k:>12}  "
+                f"{gpu_base:>12}  "
+                f"{gpu_base_k:>12}  "
                 f"{cpu:>12}  "
                 f"{tk:>12}  "
-                f"{hf:>12}  "
-                f"{gpu_cpu:>8}  "
-                f"{gpu_tk:>8}  "
-                f"{gpu_hf:>8}"
+                f"{hf:>12}"
             )
 
-        # Latency throughput
+        # Table 2: speedups of opt/base BlockBPE vs tiktoken and HF
         print("\n" + "=" * 80)
-        print("Summary (LATENCY): tokenizer throughput vs input length (tokens/sec)")
+        print("Summary (LATENCY, single sequence): BlockBPE speedup vs tiktoken / HF")
         print("=" * 80)
 
-        print(header)
-        print("-" * len(header))
+        header_speed = (
+            f"{'Len (HF tok)':>12}  "
+            f"{'opt/TK':>8}  "
+            f"{'opt/HF':>8}  "
+            f"{'base/TK':>8}  "
+            f"{'base/HF':>8}"
+        )
+        print(header_speed)
+        print("-" * len(header_speed))
 
         for length in sorted(results.keys()):
-            _, _, metrics_lat, speedups_lat = results[length]
-            gpu = fmt_tps(metrics_lat, "gpu_blockbpe")
-            cpu = fmt_tps(metrics_lat, "cpu_blockbpe")
-            tk = fmt_tps(metrics_lat, "tiktoken")
-            hf = fmt_tps(metrics_lat, "huggingface")
-            gpu_cpu = fmt_speed(speedups_lat, "gpu_vs_cpu_blockbpe")
-            gpu_tk = fmt_speed(speedups_lat, "gpu_vs_tiktoken")
-            gpu_hf = fmt_speed(speedups_lat, "gpu_vs_hf")
+            _, _, _, speedups_lat = results[length]
+            opt_tk = fmt_speed(speedups_lat, "gpu_opt_vs_tiktoken")
+            opt_hf = fmt_speed(speedups_lat, "gpu_opt_vs_hf")
+            base_tk = fmt_speed(speedups_lat, "gpu_base_vs_tiktoken")
+            base_hf = fmt_speed(speedups_lat, "gpu_base_vs_hf")
             print(
                 f"{length:12d}  "
-                f"{gpu:>12}  "
-                f"{cpu:>12}  "
-                f"{tk:>12}  "
-                f"{hf:>12}  "
-                f"{gpu_cpu:>8}  "
-                f"{gpu_tk:>8}  "
-                f"{gpu_hf:>8}"
+                f"{opt_tk:>8}  "
+                f"{opt_hf:>8}  "
+                f"{base_tk:>8}  "
+                f"{base_hf:>8}"
             )
 
     print("\n" + "=" * 80)
@@ -668,5 +923,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

@@ -1,3 +1,19 @@
+## CUDA / profiler outputs
+gpu_tokenizer
+gpu_tokenizer_optimized
+gpu_tokenizer_blockbpe
+gpu_tokenizer_blockbpe_optimized
+gpu_tokenizer_blockbpe_bs*
+*.nsys-rep
+*.qdstrm
+*.sqlite
+*.nvprof
+
+## Python / local environment
+__pycache__/
+*.pyc
+gputok_env/
+
 # ============================================
 # Python + C++ + CUDA .gitignore (Win + Linux)
 # ============================================
@@ -165,3 +181,6 @@ gpu_tokenizer_optimized_bs*
 *.nsys-rep
 *.qdstrm
 *.sqlite
+
+
+gputok_env/
