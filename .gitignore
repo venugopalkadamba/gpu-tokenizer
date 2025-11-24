@@ -1,3 +1,19 @@
+## CUDA / profiler outputs
+gpu_tokenizer
+gpu_tokenizer_optimized
+gpu_tokenizer_blockbpe
+gpu_tokenizer_blockbpe_optimized
+gpu_tokenizer_blockbpe_bs*
+*.nsys-rep
+*.qdstrm
+*.sqlite
+*.nvprof
+
+## Python / local environment
+__pycache__/
+*.pyc
+gputok_env/
+
 # ============================================
 # Python + C++ + CUDA .gitignore (Win + Linux)
 # ============================================
@@ -83,7 +99,6 @@ build/
 cmake-build*/
 CMakeFiles/
 CMakeCache.txt
-Makefile
 Makefile.in
 CMakeScripts/
 Testing/
@@ -97,6 +112,9 @@ compile_commands.json
 *.ninja
 .ninja_deps
 .ninja_log
+
+# --- External Libraries ---
+externals/
 
 # --- OS Specific ---
 # Windows
@@ -152,5 +170,17 @@ cmake-build-release/
 core
 
 # --- Custom project-specific ignores ---
-# Add your compiled kernel outputs or build dirs here:
-# e.g., /gpu_tokenizer/build/
+# Compiled CUDA executables (no extension)
+test_cuco
+gpu_tokenizer
+gpu_tokenizer_optimized
+gpu_tokenizer_bs*
+gpu_tokenizer_optimized_bs*
+
+# NVIDIA Nsight Systems profiling outputs
+*.nsys-rep
+*.qdstrm
+*.sqlite
+
+
+gputok_env/
